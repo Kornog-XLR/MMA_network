@@ -11,3 +11,4 @@ mma_cache/
 # Divers
 .vscode/
 desktop.ini
+.DS_Store
