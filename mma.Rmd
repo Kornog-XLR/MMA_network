@@ -7,6 +7,14 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+
+# Chemin du projet propre à chaque machine : défini dans config.R (ignoré par git).
+# Si config.R n'existe pas, le créer à partir de config_exemple.R.
+if (!file.exists("config.R")) {
+  stop("config.R introuvable : copiez config_exemple.R en config.R et indiquez votre chemin.")
+}
+source("config.R")
+knitr::opts_knit$set(root.dir = chemin_projet)
 ```
 
 # Analyse des combats de MMA
@@ -30,8 +38,9 @@ Etapes prévus :
     - Le réseau se construit pareil dans chaque catégorie
 
 ```{r cars}
-# On se met dans le répertoire de travail
-setwd("C:/Users/Pro/OneDrive - Université de Rennes/cours/2026-2027-M2/03_Reseaux_sociaux/projets")
+# On se met dans le répertoire de travail (chemin défini dans config.R)
+source("config.R")
+setwd(chemin_projet)
 
 # Importation du dataset large (une ligne par combat, colonne winner = "Red" / "Blue")
 library(readr)

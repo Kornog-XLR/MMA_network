@@ -1,3 +1,6 @@
+# Configuration locale (chemin propre à chaque machine)
+config.R
+
 # Fichiers de session R
 .RData
 .Rhistory

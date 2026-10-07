@@ -22,4 +22,11 @@ install.packages(c("readr", "dplyr", "igraph"))
 rmarkdown::render("mma.Rmd")
 ```
 
-Le chunk d'import contient un `setwd()` vers le dossier local : à adapter (ou supprimer) sur une autre machine.
+## Configuration locale
+
+Chaque membre a son propre dossier racine. Avant le premier lancement :
+
+1. copier `config_exemple.R` sous le nom `config.R` ;
+2. y indiquer le chemin du dossier du projet sur sa machine (`chemin_projet`).
+
+`config.R` est ignoré par git : il n'est jamais poussé sur le dépôt.
