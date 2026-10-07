@@ -309,55 +309,82 @@ Le graphe statique ne permet pas d'identifier les combattants. On le reprend ici
 
 La taille et la couleur des nœuds suivent le **PageRank**. Comme les arêtes vont du perdant vers le gagnant, un combattant reçoit du PageRank de ceux qu'il bat, d'autant plus que ceux-ci ont eux-mêmes battu beaucoup d'adversaires. Battre un combattant fort compte donc plus que battre un débutant, ce qui en fait une mesure de « qualité » des victoires, à comparer au classement UFC (étape 4). Les nœuds en périphérie sont en général des combattants avec un seul combat dans la fenêtre (arrivée récente, départ, ou passage bref à l'UFC).
 
-```{r reseau-interactif, message=FALSE}
+```{r fonction-reseau, message=FALSE}
 library(visNetwork)
 
-# Centralités sur le sous-graphe (multi-arêtes = revanches, comptées comme poids)
-pr_lw   <- page_rank(g_lw)$vector
-rang_lw <- rank(-pr_lw, ties.method = "first")
+# Réseau interactif + centralités pour une catégorie et une période
+#   g         : graphe complet (perdant -> gagnant)
+#   categorie : une ou plusieurs catégories de poids, ex. "Lightweight"
+#   annees    : années retenues, ex. 2021:2023
+#   top       : nombre de combattants mis en évidence (PageRank)
+# Renvoie une liste : $graphe (sous-graphe igraph), $centralites (tableau), $vis (widget)
+reseau_interactif <- function(g, categorie, annees, top = 10) {
+  h  <- sous_graphe(g, categorie, annees)
+  pr <- page_rank(h)$vector   # multi-arêtes (revanches) comptées comme poids
 
-centralites_lw <- tibble(name      = V(g_lw)$name,
-                         victoires = degree(g_lw, mode = "in"),
-                         defaites  = degree(g_lw, mode = "out"),
-                         pagerank  = round(pr_lw, 4),
-                         rang      = rang_lw) %>%
-  arrange(rang)
+  centralites <- tibble(name      = V(h)$name,
+                        victoires = degree(h, mode = "in"),
+                        defaites  = degree(h, mode = "out"),
+                        pagerank  = round(pr, 4),
+                        rang      = rank(-pr, ties.method = "first")) %>%
+    arrange(rang)
 
-noeuds_vis <- centralites_lw %>%
-  transmute(id    = name,
-            label = name,
-            value = pagerank,
-            group = if_else(rang <= 10, "Top 10 PageRank", "Autres combattants"),
-            title = paste0("<b>", name, "</b><br>",
-                           "Victoires : ", victoires, "<br>",
-                           "Défaites : ", defaites, "<br>",
-                           "PageRank : ", pagerank, " (rang ", rang, ")"))
+  groupe_top <- paste("Top", top, "PageRank")
 
-aretes_vis <- igraph::as_data_frame(g_lw, what = "edges") %>%
-  transmute(from, to,
-            title = paste0(to, " bat ", from, "<br>", event, " (", annee, ")<br>", method))
+  noeuds_vis <- centralites %>%
+    transmute(id    = name,
+              label = name,
+              value = pagerank,
+              group = if_else(rang <= top, groupe_top, "Autres combattants"),
+              title = paste0("<b>", name, "</b><br>",
+                             "Victoires : ", victoires, "<br>",
+                             "Défaites : ", defaites, "<br>",
+                             "PageRank : ", pagerank, " (rang ", rang, ")"))
 
-visNetwork(noeuds_vis, aretes_vis, height = "750px", width = "100%",
-           main = "Lightweight 2021–2023 : taille = PageRank, flèche vers le gagnant") %>%
-  visIgraphLayout(layout = "layout_with_fr", randomSeed = 42) %>%
-  visGroups(groupname = "Top 10 PageRank",    color = "#eb6834") %>%
-  visGroups(groupname = "Autres combattants", color = "#2a78d6") %>%
-  visNodes(scaling = list(min = 6, max = 40,
-                          label = list(enabled = TRUE, min = 12, max = 28))) %>%
-  visEdges(arrows = list(to = list(enabled = TRUE, scaleFactor = 0.4)),
-           color  = list(color = "#c8c8c8", highlight = "#333333"),
-           smooth = FALSE) %>%
-  visOptions(highlightNearest = list(enabled = TRUE, degree = 1),
-             nodesIdSelection = list(enabled = TRUE, main = "Choisir un combattant")) %>%
-  visLegend(useGroups = TRUE, position = "right") %>%
-  visInteraction(navigationButtons = TRUE)
+  aretes_vis <- igraph::as_data_frame(h, what = "edges") %>%
+    transmute(from, to,
+              title = paste0(to, " bat ", from, "<br>", event, " (", annee, ")<br>", method))
+
+  titre <- paste0(paste(categorie, collapse = ", "), " ", min(annees), "–", max(annees),
+                  " : taille = PageRank, flèche vers le gagnant")
+
+  vis <- visNetwork(noeuds_vis, aretes_vis, height = "750px", width = "100%", main = titre) %>%
+    visIgraphLayout(layout = "layout_with_fr", randomSeed = 42) %>%
+    visGroups(groupname = groupe_top,           color = "#eb6834") %>%
+    visGroups(groupname = "Autres combattants", color = "#2a78d6") %>%
+    visNodes(scaling = list(min = 6, max = 40,
+                            label = list(enabled = TRUE, min = 12, max = 28))) %>%
+    visEdges(arrows = list(to = list(enabled = TRUE, scaleFactor = 0.4)),
+             color  = list(color = "#c8c8c8", highlight = "#333333"),
+             smooth = FALSE) %>%
+    visOptions(highlightNearest = list(enabled = TRUE, degree = 1),
+               nodesIdSelection = list(enabled = TRUE, main = "Choisir un combattant")) %>%
+    visLegend(useGroups = TRUE, position = "right") %>%
+    visInteraction(navigationButtons = TRUE)
+
+  list(graphe = h, centralites = centralites, vis = vis)
+}
+
+# Tableau triable et filtrable des centralités
+table_centralites <- function(centralites) {
+  DT::datatable(centralites, rownames = FALSE,
+                colnames = c("Combattant", "Victoires", "Défaites", "PageRank", "Rang"),
+                options = list(pageLength = 15, order = list(list(4, "asc"))))
+}
+```
+
+```{r reseau-lightweight}
+lw <- reseau_interactif(g, "Lightweight", 2021:2023)
+lw$vis
+
+# Autre catégorie ou autre période : un appel suffit, par exemple
+# ww <- reseau_interactif(g, "Welterweight", 2018:2020)
+# ww$vis
 ```
 
 Le tableau ci-dessous classe tous les combattants de la fenêtre par PageRank ; il se trie en cliquant sur une colonne et se filtre avec le champ de recherche.
 
 ```{r centralites-table}
-DT::datatable(centralites_lw, rownames = FALSE,
-              colnames = c("Combattant", "Victoires", "Défaites", "PageRank", "Rang"),
-              options = list(pageLength = 15, order = list(list(4, "asc"))))
+table_centralites(lw$centralites)
 ```
 

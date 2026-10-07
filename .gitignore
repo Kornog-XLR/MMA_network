@@ -15,3 +15,6 @@ mma_cache/
 .vscode/
 desktop.ini
 .DS_Store
+
+# Journal de travail personnel
+journal.md
