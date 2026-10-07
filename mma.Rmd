@@ -43,15 +43,12 @@ evenements <- read_csv("dataset_ufc/UFC dataset/Small set/completed_events_small
 
 ```
 
-## Construction du graphe
-
-Chaque nœud est un combattant. Chaque combat gagné donne une arête orientée **du perdant vers le gagnant** : le degré entrant d'un combattant est donc son nombre de victoires, le degré sortant son nombre de défaites.
+## Préparation des données
 
 Dans le dataset large, la colonne `winner` vaut `"Red"` ou `"Blue"` : le gagnant est `r_fighter` si `winner == "Red"`, `b_fighter` sinon. Il n'y a ni match nul ni combat sans résultat (7 439 combats). La date de chaque combat vient de `completed_events_small.csv`, joint par le nom de l'événement. Les intitulés de ceinture (« UFC Lightweight Title », tournois TUF…) sont ramenés à leur catégorie de poids ; les tournois des premiers UFC, sans catégorie, sont classés « Open Weight ».
 
-```{r graphe, message=FALSE, warning=FALSE}
+```{r preparation, message=FALSE, warning=FALSE}
 library(dplyr)
-library(igraph)
 
 # 1. Combats : gagnant / perdant, date et catégorie de poids nettoyée
 categories <- c("Women's Strawweight", "Women's Flyweight", "Women's Bantamweight",
@@ -74,6 +71,145 @@ combats <- large_dataset %>%
          annee        = as.integer(format(date, "%Y")),
          intitule     = weight_class,
          weight_class = extraire_categorie(weight_class))
+```
+
+## Statistiques descriptives
+
+Avant de construire le réseau, on décrit la population de combattants et l'activité de l'UFC dans le temps. Ces statistiques orientent trois choix de la suite : la période retenue (l'activité n'est pas constante dans le temps), le découpage par genre et par catégorie (les sous-réseaux ne communiquent pas entre eux) et la largeur de la fenêtre temporelle (elle doit être cohérente avec la durée de carrière des combattants).
+
+```{r combattants, message=FALSE}
+library(ggplot2)
+
+couleurs_genre  <- c(Hommes = "#2a78d6", Femmes = "#eb6834")
+couleurs_statut <- c("Carrière terminée" = "#2a78d6", "Encore actif" = "#eb6834")
+
+# Date du dernier événement du dataset (23 mars 2024)
+date_ref <- max(combats$date)
+
+# Une ligne par combattant et par combat (chaque combat compte pour les deux)
+participations <- bind_rows(
+  combats %>% transmute(name = r_fighter, date, gender, age_actuel = r_age),
+  combats %>% transmute(name = b_fighter, date, gender, age_actuel = b_age))
+
+# Une ligne par combattant
+combattants <- participations %>%
+  group_by(name) %>%
+  summarise(genre      = names(which.max(table(gender))),
+            age_actuel = first(age_actuel),
+            debut      = min(date),
+            fin        = max(date),
+            nb_combats = n(),
+            .groups    = "drop") %>%
+  mutate(genre     = recode(genre, Men = "Hommes", Women = "Femmes"),
+         carriere  = as.numeric(fin - debut) / 365.25,
+         # L'âge du dataset est l'âge en mars 2024 : on remonte au premier combat
+         age_debut = age_actuel - as.numeric(date_ref - debut) / 365.25,
+         statut    = if_else(fin >= date_ref - 365, "Encore actif", "Carrière terminée"))
+```
+
+### Activité de l'UFC par année
+
+L'UFC passe de quelques événements par an dans les années 1990 à une quarantaine par an à partir de 2014. Un réseau construit sur une année ancienne contient donc très peu de combats : la comparaison entre périodes (étape 6) doit tenir compte de cette croissance, et les analyses centrées sur le classement actuel portent naturellement sur les années récentes. L'année 2024 est incomplète (données arrêtées au 23 mars).
+
+```{r activite, fig.width=9, fig.height=3.5}
+nb_evenements <- combats %>%
+  distinct(event_name, annee) %>%
+  count(annee, name = "evenements")
+
+ggplot(nb_evenements, aes(annee, evenements)) +
+  geom_col(fill = "#2a78d6", width = 0.8) +
+  labs(x = NULL, y = "Événements",
+       title = "Nombre d'événements UFC par année",
+       subtitle = "2024 : jusqu'au 23 mars") +
+  theme_minimal()
+
+combats %>%
+  mutate(genre = recode(gender, Men = "Hommes", Women = "Femmes")) %>%
+  count(annee, genre) %>%
+  ggplot(aes(annee, n, fill = genre)) +
+  geom_col(width = 0.8) +
+  scale_fill_manual(values = couleurs_genre) +
+  labs(x = NULL, y = "Combats", fill = NULL,
+       title = "Nombre de combats par année et par genre") +
+  theme_minimal()
+```
+
+### Genre et âge
+
+Les hommes et les femmes ne combattent jamais entre eux : le réseau se sépare en deux sous-réseaux sans aucun lien. Les catégories féminines n'apparaissent qu'à partir de 2013. Il faut donc analyser les réseaux par genre (ce que fait déjà le découpage par catégorie de poids), et ne pas comparer directement des centralités calculées sur des réseaux de tailles très différentes.
+
+L'âge est une variable de contexte pour l'étape 5 (styles de combat) : un combattant qui débute tard a moins d'années devant lui pour accumuler des victoires, donc de la centralité. Le dataset ne donne que l'âge au moment de la collecte (mars 2024), identique pour tous les combats d'un même combattant ; l'âge au premier combat est reconstruit en retranchant le temps écoulé depuis ce combat (précision d'environ un an).
+
+```{r genre-age, fig.width=9, fig.height=3.5, warning=FALSE}
+combattants %>%
+  group_by(genre) %>%
+  summarise(combattants      = n(),
+            age_debut_median = round(median(age_debut, na.rm = TRUE), 1),
+            age_debut_q1     = round(quantile(age_debut, 0.25, na.rm = TRUE), 1),
+            age_debut_q3     = round(quantile(age_debut, 0.75, na.rm = TRUE), 1),
+            age_inconnu      = sum(is.na(age_debut))) %>%
+  mutate(part = paste0(round(100 * combattants / sum(combattants), 1), " %"))
+
+ggplot(filter(combattants, !is.na(age_debut)), aes(age_debut, fill = genre)) +
+  geom_histogram(binwidth = 1, boundary = 0, colour = "white") +
+  facet_wrap(~ genre, scales = "free_y") +
+  scale_fill_manual(values = couleurs_genre, guide = "none") +
+  labs(x = "Âge au premier combat UFC (années, approximatif)",
+       y = "Combattants",
+       title = "Âge d'entrée à l'UFC selon le genre") +
+  theme_minimal()
+```
+
+### Durée de carrière à l'UFC
+
+La durée de carrière est mesurée comme l'écart entre le premier et le dernier combat UFC du combattant. Elle conditionne directement la construction du réseau : si la plupart des carrières durent deux ou trois ans, une fenêtre d'un an ne relie presque personne, alors qu'une fenêtre de trois ans couvre l'essentiel d'une carrière. C'est ce qu'on observe sur Lightweight : seuls 20 % des combattants de 2023 sont reliés au même bloc, contre 97 % sur 2021–2023.
+
+Sur `r nrow(combattants)` combattants, `r sum(combattants$nb_combats == 1)` n'ont fait qu'un seul combat UFC. La durée médiane de carrière est de `r round(median(combattants$carriere), 1)` an, et `r sum(combattants$carriere >= 10)` combattants dépassent dix ans. Les combattants « encore actifs » (au moins un combat dans les douze mois précédant mars 2024) ont une carrière non terminée : leur durée est sous-estimée.
+
+```{r carriere, fig.width=9, fig.height=3.5}
+combattants %>%
+  summarise(combattants    = n(),
+            un_seul_combat = sum(nb_combats == 1),
+            mediane_annees = round(median(carriere), 1),
+            plus_de_5_ans  = sum(carriere >= 5),
+            plus_de_10_ans = sum(carriere >= 10))
+
+ggplot(filter(combattants, nb_combats >= 2), aes(carriere, fill = statut)) +
+  geom_histogram(binwidth = 1, boundary = 0, colour = "white") +
+  scale_fill_manual(values = couleurs_statut) +
+  labs(x = "Durée de carrière UFC (années)", y = "Combattants", fill = NULL,
+       title = "Durée de carrière des combattants ayant au moins deux combats") +
+  theme_minimal()
+```
+
+Chaque combattant ayant au moins deux combats est représenté ci-dessous par un segment allant de son premier à son dernier combat, trié par date de début. Les segments longs repèrent les carrières de plus de dix ans.
+
+```{r lignes-de-vie, fig.width=9, fig.height=7}
+combattants %>%
+  filter(nb_combats >= 2) %>%
+  arrange(debut, fin) %>%
+  mutate(rang = row_number()) %>%
+  ggplot(aes(y = rang, colour = statut)) +
+  geom_segment(aes(x = debut, xend = fin, yend = rang), linewidth = 0.3) +
+  scale_colour_manual(values = couleurs_statut) +
+  labs(x = NULL, y = "Combattants (triés par date de premier combat)", colour = NULL,
+       title = "Carrière UFC de chaque combattant, du premier au dernier combat") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(), panel.grid.major.y = element_blank(),
+        legend.position = "top")
+
+# Les 10 carrières les plus longues
+combattants %>%
+  slice_max(carriere, n = 10) %>%
+  transmute(name, debut, fin, carriere = round(carriere, 1), nb_combats)
+```
+
+## Construction du graphe
+
+Chaque nœud est un combattant. Chaque combat gagné donne une arête orientée **du perdant vers le gagnant** : le degré entrant d'un combattant est donc son nombre de victoires, le degré sortant son nombre de défaites.
+
+```{r graphe, message=FALSE, warning=FALSE}
+library(igraph)
 
 # 2. Arêtes : perdant -> gagnant (+ attributs du combat)
 aretes <- combats %>%
