@@ -88,6 +88,7 @@ Avant de construire le réseau, on décrit la population de combattants et l'act
 
 ```{r combattants, message=FALSE}
 library(ggplot2)
+library(plotly)   # graphiques interactifs : ggplotly(p)
 
 couleurs_genre  <- c(Hommes = "#2a78d6", Femmes = "#eb6834")
 couleurs_statut <- c("Carrière terminée" = "#2a78d6", "Encore actif" = "#eb6834")
@@ -125,14 +126,14 @@ nb_evenements <- combats %>%
   distinct(event_name, annee) %>%
   count(annee, name = "evenements")
 
-ggplot(nb_evenements, aes(annee, evenements)) +
+p_evenements <- ggplot(nb_evenements, aes(annee, evenements)) +
   geom_col(fill = "#2a78d6", width = 0.8) +
   labs(x = NULL, y = "Événements",
-       title = "Nombre d'événements UFC par année",
-       subtitle = "2024 : jusqu'au 23 mars") +
+       title = "Nombre d'événements UFC par année (2024 : jusqu'au 23 mars)") +
   theme_minimal()
+ggplotly(p_evenements)
 
-combats %>%
+p_combats <- combats %>%
   mutate(genre = recode(gender, Men = "Hommes", Women = "Femmes")) %>%
   count(annee, genre) %>%
   ggplot(aes(annee, n, fill = genre)) +
@@ -141,6 +142,7 @@ combats %>%
   labs(x = NULL, y = "Combats", fill = NULL,
        title = "Nombre de combats par année et par genre") +
   theme_minimal()
+ggplotly(p_combats)
 ```
 
 ### Genre et âge
@@ -159,7 +161,7 @@ combattants %>%
             age_inconnu      = sum(is.na(age_debut))) %>%
   mutate(part = paste0(round(100 * combattants / sum(combattants), 1), " %"))
 
-ggplot(filter(combattants, !is.na(age_debut)), aes(age_debut, fill = genre)) +
+p_age <- ggplot(filter(combattants, !is.na(age_debut)), aes(age_debut, fill = genre)) +
   geom_histogram(binwidth = 1, boundary = 0, colour = "white") +
   facet_wrap(~ genre, scales = "free_y") +
   scale_fill_manual(values = couleurs_genre, guide = "none") +
@@ -167,6 +169,7 @@ ggplot(filter(combattants, !is.na(age_debut)), aes(age_debut, fill = genre)) +
        y = "Combattants",
        title = "Âge d'entrée à l'UFC selon le genre") +
   theme_minimal()
+ggplotly(p_age)
 ```
 
 ### Durée de carrière à l'UFC
@@ -183,22 +186,26 @@ combattants %>%
             plus_de_5_ans  = sum(carriere >= 5),
             plus_de_10_ans = sum(carriere >= 10))
 
-ggplot(filter(combattants, nb_combats >= 2), aes(carriere, fill = statut)) +
+p_carriere <- ggplot(filter(combattants, nb_combats >= 2), aes(carriere, fill = statut)) +
   geom_histogram(binwidth = 1, boundary = 0, colour = "white") +
   scale_fill_manual(values = couleurs_statut) +
   labs(x = "Durée de carrière UFC (années)", y = "Combattants", fill = NULL,
        title = "Durée de carrière des combattants ayant au moins deux combats") +
   theme_minimal()
+ggplotly(p_carriere)
 ```
 
 Chaque combattant ayant au moins deux combats est représenté ci-dessous par un segment allant de son premier à son dernier combat, trié par date de début. Les segments longs repèrent les carrières de plus de dix ans.
 
-```{r lignes-de-vie, fig.width=9, fig.height=7}
-combattants %>%
+```{r lignes-de-vie, fig.width=9, fig.height=7, warning=FALSE}
+p_vie <- combattants %>%
   filter(nb_combats >= 2) %>%
   arrange(debut, fin) %>%
-  mutate(rang = row_number()) %>%
-  ggplot(aes(y = rang, colour = statut)) +
+  mutate(rang  = row_number(),
+         infos = paste0(name, "<br>", format(debut, "%d/%m/%Y"), " → ",
+                        format(fin, "%d/%m/%Y"), "<br>",
+                        round(carriere, 1), " ans, ", nb_combats, " combats")) %>%
+  ggplot(aes(y = rang, colour = statut, text = infos)) +
   geom_segment(aes(x = debut, xend = fin, yend = rang), linewidth = 0.3) +
   scale_colour_manual(values = couleurs_statut) +
   labs(x = NULL, y = "Combattants (triés par date de premier combat)", colour = NULL,
@@ -206,6 +213,7 @@ combattants %>%
   theme_minimal() +
   theme(axis.text.y = element_blank(), panel.grid.major.y = element_blank(),
         legend.position = "top")
+ggplotly(p_vie, tooltip = "text")   # survol : nom, dates, durée ; zoom à la souris
 
 # Les 10 carrières les plus longues
 combattants %>%
@@ -292,6 +300,64 @@ plot(g_lw,
      vertex.label.color = "black",
      edge.arrow.size    = 0.3,
      edge.color         = "grey60",
-     main = "Lightweight 2023 : arêtes du perdant vers le gagnant")
+     main = "Lightweight 2021–2023 : arêtes du perdant vers le gagnant")
+```
+
+### Exploration interactive du réseau
+
+Le graphe statique ne permet pas d'identifier les combattants. On le reprend ici en version interactive : molette pour zoomer, survol d'un nœud pour voir son nom et ses statistiques, clic sur un nœud (ou choix dans la liste) pour isoler ses adversaires directs. Les noms des petits nœuds apparaissent en zoomant.
+
+La taille et la couleur des nœuds suivent le **PageRank**. Comme les arêtes vont du perdant vers le gagnant, un combattant reçoit du PageRank de ceux qu'il bat, d'autant plus que ceux-ci ont eux-mêmes battu beaucoup d'adversaires. Battre un combattant fort compte donc plus que battre un débutant, ce qui en fait une mesure de « qualité » des victoires, à comparer au classement UFC (étape 4). Les nœuds en périphérie sont en général des combattants avec un seul combat dans la fenêtre (arrivée récente, départ, ou passage bref à l'UFC).
+
+```{r reseau-interactif, message=FALSE}
+library(visNetwork)
+
+# Centralités sur le sous-graphe (multi-arêtes = revanches, comptées comme poids)
+pr_lw   <- page_rank(g_lw)$vector
+rang_lw <- rank(-pr_lw, ties.method = "first")
+
+centralites_lw <- tibble(name      = V(g_lw)$name,
+                         victoires = degree(g_lw, mode = "in"),
+                         defaites  = degree(g_lw, mode = "out"),
+                         pagerank  = round(pr_lw, 4),
+                         rang      = rang_lw) %>%
+  arrange(rang)
+
+noeuds_vis <- centralites_lw %>%
+  transmute(id    = name,
+            label = name,
+            value = pagerank,
+            group = if_else(rang <= 10, "Top 10 PageRank", "Autres combattants"),
+            title = paste0("<b>", name, "</b><br>",
+                           "Victoires : ", victoires, "<br>",
+                           "Défaites : ", defaites, "<br>",
+                           "PageRank : ", pagerank, " (rang ", rang, ")"))
+
+aretes_vis <- igraph::as_data_frame(g_lw, what = "edges") %>%
+  transmute(from, to,
+            title = paste0(to, " bat ", from, "<br>", event, " (", annee, ")<br>", method))
+
+visNetwork(noeuds_vis, aretes_vis, height = "750px", width = "100%",
+           main = "Lightweight 2021–2023 : taille = PageRank, flèche vers le gagnant") %>%
+  visIgraphLayout(layout = "layout_with_fr", randomSeed = 42) %>%
+  visGroups(groupname = "Top 10 PageRank",    color = "#eb6834") %>%
+  visGroups(groupname = "Autres combattants", color = "#2a78d6") %>%
+  visNodes(scaling = list(min = 6, max = 40,
+                          label = list(enabled = TRUE, min = 12, max = 28))) %>%
+  visEdges(arrows = list(to = list(enabled = TRUE, scaleFactor = 0.4)),
+           color  = list(color = "#c8c8c8", highlight = "#333333"),
+           smooth = FALSE) %>%
+  visOptions(highlightNearest = list(enabled = TRUE, degree = 1),
+             nodesIdSelection = list(enabled = TRUE, main = "Choisir un combattant")) %>%
+  visLegend(useGroups = TRUE, position = "right") %>%
+  visInteraction(navigationButtons = TRUE)
+```
+
+Le tableau ci-dessous classe tous les combattants de la fenêtre par PageRank ; il se trie en cliquant sur une colonne et se filtre avec le champ de recherche.
+
+```{r centralites-table}
+DT::datatable(centralites_lw, rownames = FALSE,
+              colnames = c("Combattant", "Victoires", "Défaites", "PageRank", "Rang"),
+              options = list(pageLength = 15, order = list(list(4, "asc"))))
 ```
 
