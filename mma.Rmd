@@ -1,0 +1,152 @@
+---
+title: "MMA network"
+author: "Adrien et Nicolas"
+date: "2026-10-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Analyse des combats de MMA
+## Projet M2 MAS
+
+On s'interroge sur les combats de MMA dans le cadre de la compétition mondiale UFC. 
+Objectif : analyser la centralité du réseau et la comparer au classement UFC. On suppose que le classement UFC n'est pas forcément reprsentatif des meilleurs combattants mais plutôt des combattants les plus vendeurs/dont les combats font le plus de vu (KO au premier round, plutôt pas gain par poids.)
+
+Le graph représente les combattants reliés par des liens directionnels vers le du perdant vers le gagnant.
+
+Etapes prévus :
+1. Descriptoin des données
+2. Echantillonnage par catégories de poids et sur une seule année
+3. On réalise d'abord un simple graph'
+4. Qui sont les éléments les plus centraux
+    - Comparaison UFC
+5. Est-ce que le réseau s'associe à des styles de combat ?
+    - Comparaison UFC
+6. Analyse interréseau selon poids ou années ou les deux
+    - Classement robsute d'une année sur l'autre ?
+    - Le réseau se construit pareil dans chaque catégorie
+
+```{r cars}
+# On se met dans le répertoire de travail
+setwd("C:/Users/Pro/OneDrive - Université de Rennes/cours/2026-2027-M2/03_Reseaux_sociaux/projets")
+
+# Importation du dataset large (une ligne par combat, colonne winner = "Red" / "Blue")
+library(readr)
+large_dataset <- read_csv("dataset_ufc/UFC dataset/Large set/large_dataset.csv")
+
+# Le dataset large n'a pas de date : on la récupère par le nom de l'événement
+evenements <- read_csv("dataset_ufc/UFC dataset/Small set/completed_events_small.csv")
+
+
+```
+
+## Construction du graphe
+
+Chaque nœud est un combattant. Chaque combat gagné donne une arête orientée **du perdant vers le gagnant** : le degré entrant d'un combattant est donc son nombre de victoires, le degré sortant son nombre de défaites.
+
+Dans le dataset large, la colonne `winner` vaut `"Red"` ou `"Blue"` : le gagnant est `r_fighter` si `winner == "Red"`, `b_fighter` sinon. Il n'y a ni match nul ni combat sans résultat (7 439 combats). La date de chaque combat vient de `completed_events_small.csv`, joint par le nom de l'événement. Les intitulés de ceinture (« UFC Lightweight Title », tournois TUF…) sont ramenés à leur catégorie de poids ; les tournois des premiers UFC, sans catégorie, sont classés « Open Weight ».
+
+```{r graphe, message=FALSE, warning=FALSE}
+library(dplyr)
+library(igraph)
+
+# 1. Combats : gagnant / perdant, date et catégorie de poids nettoyée
+categories <- c("Women's Strawweight", "Women's Flyweight", "Women's Bantamweight",
+                "Women's Featherweight", "Light Heavyweight", "Super Heavyweight",
+                "Heavyweight", "Middleweight", "Welterweight", "Lightweight",
+                "Featherweight", "Bantamweight", "Flyweight", "Catch Weight",
+                "Open Weight")
+
+# "UFC Interim Lightweight Title" -> "Lightweight", "UFC 4 Tournament Title" -> "Open Weight"
+extraire_categorie <- function(x) {
+  m <- regexpr(paste(categories, collapse = "|"), x)
+  ifelse(m > 0, substr(x, m, m + attr(m, "match.length") - 1), "Open Weight")
+}
+
+combats <- large_dataset %>%
+  left_join(select(evenements, event_name = event, date), by = "event_name") %>%
+  mutate(gagnant      = if_else(winner == "Red", r_fighter, b_fighter),
+         perdant      = if_else(winner == "Red", b_fighter, r_fighter),
+         date         = parse_date(date, format = "%B %d, %Y", locale = locale("en")),
+         annee        = as.integer(format(date, "%Y")),
+         intitule     = weight_class,
+         weight_class = extraire_categorie(weight_class))
+
+# 2. Arêtes : perdant -> gagnant (+ attributs du combat)
+aretes <- combats %>%
+  transmute(from = perdant, to = gagnant,
+            date, annee, event = event_name, weight_class,
+            titre = is_title_bout == 1, method, round = finish_round)
+
+# 3. Nœuds : un par combattant, avec victoires / défaites
+noeuds <- tibble(name = unique(c(aretes$from, aretes$to))) %>%
+  left_join(count(aretes, to,   name = "victoires"), by = c("name" = "to")) %>%
+  left_join(count(aretes, from, name = "defaites"),  by = c("name" = "from")) %>%
+  mutate(victoires = coalesce(victoires, 0L),
+         defaites  = coalesce(defaites, 0L))
+
+# Catégorie de poids principale de chaque combattant (la plus fréquente)
+categorie_principale <- bind_rows(
+    select(aretes, name = from, weight_class),
+    select(aretes, name = to,   weight_class)) %>%
+  count(name, weight_class) %>%
+  group_by(name) %>%
+  slice_max(n, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(name, categorie = weight_class)
+
+noeuds <- left_join(noeuds, categorie_principale, by = "name")
+
+# 4. Graphe orienté (multigraphe : une arête par combat, revanches comprises)
+g <- graph_from_data_frame(aretes, directed = TRUE, vertices = noeuds)
+
+# Version simplifiée et pondérée : une arête par paire, poids = nb de victoires
+E(g)$weight <- 1
+g_pondere <- simplify(g, remove.multiple = TRUE, remove.loops = TRUE,
+                      edge.attr.comb = list(weight = "sum", "ignore"))
+
+cat("Combattants (nœuds) :", vcount(g),
+    "\nCombats (arêtes)    :", ecount(g),
+    "\nDensité             :", round(edge_density(g_pondere), 5),
+    "\nComposantes faibles :", components(g, mode = "weak")$no, "\n")
+
+# Les 10 combattants avec le plus de victoires
+noeuds %>% arrange(desc(victoires)) %>% head(10)
+```
+
+### Sous-graphe par catégorie de poids et par année
+
+Le graphe complet (environ 2 400 combattants) est illisible ; on extrait des sous-graphes par catégorie et par année (étape 2 du plan).
+
+On a d'abord essayé d'extraire 2023 mais un combattant lambda fait 2-3 combats par an
+
+```{r sous-graphe, fig.width=10, fig.height=8}
+# Garde les combats d'une ou plusieurs catégories et/ou années
+sous_graphe <- function(g, categorie = NULL, annees = NULL) {
+  garder <- rep(TRUE, ecount(g))
+  if (!is.null(categorie)) garder <- garder & E(g)$weight_class %in% categorie
+  if (!is.null(annees))    garder <- garder & E(g)$annee %in% annees
+  h <- delete_edges(g, which(!garder))
+  delete_vertices(h, which(degree(h) == 0))
+}
+
+g_lw <- sous_graphe(g, categorie = "Lightweight", annees = 2021:2023) # sur un seul année pas assez de lien car que 2-3 combats par an -> étalé sur 3 ans
+
+set.seed(42)
+victoires_lw <- degree(g_lw, mode = "in")
+plot(g_lw,
+     layout             = layout_with_fr(g_lw),
+     vertex.size        = 3 + 3 * victoires_lw,
+     vertex.color       = "steelblue",
+     vertex.frame.color = NA,
+     vertex.label       = ifelse(victoires_lw >= 2, V(g_lw)$name, NA),
+     vertex.label.cex   = 0.7,
+     vertex.label.color = "black",
+     edge.arrow.size    = 0.3,
+     edge.color         = "grey60",
+     main = "Lightweight 2023 : arêtes du perdant vers le gagnant")
+```
+

@@ -1,0 +1,13 @@
+# Fichiers de session R
+.RData
+.Rhistory
+.Rproj.user/
+
+# Sorties générées par le knit
+*.html
+mma_files/
+mma_cache/
+
+# Divers
+.vscode/
+desktop.ini
