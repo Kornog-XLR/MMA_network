@@ -44,10 +44,10 @@ setwd(chemin_projet)
 
 # Importation du dataset large (une ligne par combat, colonne winner = "Red" / "Blue")
 library(readr)
-large_dataset <- read_csv("dataset_ufc/UFC dataset/Large set/large_dataset.csv")
+large_dataset <- read_csv("dataset_ufc/UFC dataset/Large set/large_dataset.csv", show_col_types = FALSE)
 
 # Le dataset large n'a pas de date : on la récupère par le nom de l'événement
-evenements <- read_csv("dataset_ufc/UFC dataset/Small set/completed_events_small.csv")
+evenements <- read_csv("dataset_ufc/UFC dataset/Small set/completed_events_small.csv", show_col_types = FALSE)
 
 
 ```
@@ -80,6 +80,176 @@ combats <- large_dataset %>%
          annee        = as.integer(format(date, "%Y")),
          intitule     = weight_class,
          weight_class = extraire_categorie(weight_class))
+```
+
+## Styles de combat
+
+Le dataset ne contient pas de variable « style », mais il décrit chaque combat coup par coup : frappes significatives, amenées au sol, tentatives de soumission, temps de contrôle au sol et knockdowns, pour chacun des deux combattants. On en déduit un style dominant pour chaque combattant, qui servira à l'étape 5 (le réseau s'organise-t-il selon les styles ?) et à la comparaison avec le classement UFC (les combattants sur-classés ont-ils un style particulier ?).
+
+**Variables retenues.** Cinq taux, chacun associé à une dimension du MMA :
+
+| Variable | Dimension | Calcul |
+|---|---|---|
+| `frappes_min` | volume de frappe debout | frappes significatives réussies par minute |
+| `kd_15` | puissance de frappe | knockdowns par 15 minutes |
+| `amenees_15` | lutte | amenées au sol réussies par 15 minutes |
+| `part_controle` | contrôle au sol | part du temps de combat passée en contrôle |
+| `soumissions_15` | jiu-jitsu / soumission | tentatives de soumission par 15 minutes |
+
+Ce sont des **taux** et non des totaux, pour comparer des combattants qui n'ont pas combattu le même temps ; 15 minutes correspond à un combat standard en trois rounds. Les taux sont calculés sur le cumul de tous les combats du combattant (total des frappes / total des minutes), et non comme une moyenne des taux combat par combat, qui donnerait trop de poids aux combats très courts. La durée d'un combat est (round final − 1) × 5 min + temps écoulé dans le dernier round ; elle est approximative pour les tout premiers UFC, dont les rounds n'étaient pas de 5 minutes.
+
+**Variables écartées.** La méthode de victoire (KO, soumission, décision) n'est volontairement pas utilisée pour construire les styles : elle sert ensuite à les **valider** de façon indépendante. Les précisions et défenses (pourcentages de frappes réussies, défense contre les amenées) mesurent davantage le niveau que le style. Les statistiques de carrière déjà calculées du dataset (`r_SLpM_total`, `fighter_stats.csv`…) sont arrêtées en mars 2024 : les utiliser pour une date antérieure introduirait de l'information du futur. La garde (orthodox / southpaw) n'est pas un style.
+
+**Seuils.** Un style n'est attribué qu'aux combattants ayant au moins 5 combats et 45 minutes de combat ; en dessous, les taux sont trop instables (un seul combat court peut donner un taux extrême) et le style est noté « Indéterminé ».
+
+**Mise à l'échelle par catégorie de poids.** Un poids lourd frappe moins souvent qu'un poids mouche : sans correction, tous les lourds seraient classés « lutteurs » et tous les légers « frappeurs ». Chaque taux est donc centré-réduit à l'intérieur de la catégorie principale du combattant. Pour les catégories avec moins de 20 combattants éligibles (Open Weight, Women's Featherweight…), la moyenne et l'écart-type seraient trop instables : on utilise alors la mise à l'échelle sur l'ensemble des combattants.
+
+**Regroupement.** Méthode des k-moyennes (`kmeans`) sur les cinq taux standardisés, avec 25 initialisations aléatoires (`nstart = 25`) pour éviter une mauvaise solution locale et une graine fixe pour la reproductibilité. Le nombre de groupes est discuté plus bas avec le critère de silhouette.
+
+**Nommage.** Les numéros de groupes produits par `kmeans` sont arbitraires. Avec 4 groupes, on les nomme à partir de leurs centres : le groupe le plus élevé en soumissions devient « Spécialiste soumission », puis, parmi les restants, le plus élevé en amenées + contrôle « Lutteur / contrôle », puis le plus élevé en knockdowns « Frappeur KO », et le dernier « Complet / polyvalent ». Avec un autre nombre de groupes, ils sont simplement numérotés.
+
+**Fenêtre de temps.** Les arguments `debut` et `fin` permettent de calculer les styles uniquement sur les combats d'une période (par exemple la même fenêtre de trois ans que le réseau), pour ne pas utiliser de combats postérieurs à la date étudiée. Par défaut, toute la période est utilisée.
+
+```{r fonctions-styles}
+vars_style <- c("frappes_min", "kd_15", "amenees_15", "part_controle", "soumissions_15")
+
+# 1. Profil de chaque combattant : taux cumulés + taux standardisés (z_*) par catégorie
+profils_combat <- function(combats, debut = NULL, fin = NULL,
+                           min_combats = 5, min_minutes = 45,
+                           min_par_categorie = 20) {
+  if (!is.null(debut)) combats <- filter(combats, date >= debut)
+  if (!is.null(fin))   combats <- filter(combats, date <  fin)
+
+  combats <- mutate(combats, duree_sec = (finish_round - 1) * 300 + time_sec)
+
+  # Une ligne par combattant et par combat
+  cote <- function(prefixe) {
+    combats %>%
+      transmute(name      = .data[[paste0(prefixe, "_fighter")]],
+                weight_class, duree_sec,
+                sig_str   = .data[[paste0(prefixe, "_sig_str")]],
+                kd        = .data[[paste0(prefixe, "_kd")]],
+                td        = .data[[paste0(prefixe, "_td")]],
+                ctrl_sec  = .data[[paste0(prefixe, "_ctrl_sec")]],
+                sub_att   = .data[[paste0(prefixe, "_sub_att")]])
+  }
+
+  profils <- bind_rows(cote("r"), cote("b")) %>%
+    group_by(name) %>%
+    summarise(categorie   = names(which.max(table(weight_class))),
+              nb_combats  = n(),
+              minutes     = sum(duree_sec) / 60,
+              sig_str     = sum(sig_str), kd = sum(kd), td = sum(td),
+              ctrl_sec    = sum(ctrl_sec), sub_att = sum(sub_att),
+              .groups = "drop") %>%
+    mutate(frappes_min    = sig_str / minutes,
+           kd_15          = kd / minutes * 15,
+           amenees_15     = td / minutes * 15,
+           part_controle  = ctrl_sec / (minutes * 60),
+           soumissions_15 = sub_att / minutes * 15,
+           eligible       = nb_combats >= min_combats & minutes >= min_minutes)
+
+  # Standardisation des éligibles : par catégorie, ou globale si la catégorie est trop petite
+  elig    <- filter(profils, eligible)
+  globale <- scale(as.matrix(elig[vars_style]))
+  elig <- elig %>%
+    group_by(categorie) %>%
+    mutate(n_categorie = n(),
+           across(all_of(vars_style), ~ (.x - mean(.x)) / sd(.x), .names = "z_{.col}")) %>%
+    ungroup()
+  petites <- elig$n_categorie < min_par_categorie
+  Z <- as.matrix(elig[paste0("z_", vars_style)])
+  Z[petites, ] <- globale[petites, ]
+  elig[paste0("z_", vars_style)] <- as.data.frame(Z)
+
+  profils %>%
+    left_join(select(elig, name, n_categorie, starts_with("z_")), by = "name")
+}
+
+# 2. Styles : k-moyennes sur les taux standardisés, puis nommage des groupes
+calculer_styles <- function(profils, k = 4, graine = 42) {
+  elig <- filter(profils, eligible)
+  Z    <- as.matrix(select(elig, starts_with("z_")))
+
+  set.seed(graine)
+  km <- kmeans(Z, centers = k, nstart = 25, iter.max = 100)
+  centres <- km$centers
+
+  noms <- paste("Style", seq_len(k))
+  if (k == 4) {
+    reste <- seq_len(k)
+    j <- reste[which.max(centres[reste, "z_soumissions_15"])]
+    noms[j] <- "Spécialiste soumission"; reste <- setdiff(reste, j)
+    j <- reste[which.max(centres[reste, "z_amenees_15"] + centres[reste, "z_part_controle"])]
+    noms[j] <- "Lutteur / contrôle";     reste <- setdiff(reste, j)
+    j <- reste[which.max(centres[reste, "z_kd_15"])]
+    noms[j] <- "Frappeur KO";            reste <- setdiff(reste, j)
+    noms[reste] <- "Complet / polyvalent"
+  }
+
+  elig$style <- noms[km$cluster]
+  niveaux <- c(sort(unique(noms)), "Indéterminé")
+
+  profils %>%
+    left_join(select(elig, name, style), by = "name") %>%
+    mutate(style = factor(coalesce(style, "Indéterminé"), levels = niveaux))
+}
+
+# 3. Ajoute le style du gagnant et du perdant à chaque combat
+ajouter_styles <- function(combats, styles) {
+  s <- select(styles, name, style)
+  combats %>%
+    left_join(rename(s, gagnant = name, style_gagnant = style), by = "gagnant") %>%
+    left_join(rename(s, perdant = name, style_perdant = style), by = "perdant")
+}
+```
+
+On calcule les styles sur toute la période, puis on les ajoute aux combats. Pour une analyse à une date donnée, il suffit de recalculer avec `profils_combat(combats, debut = ..., fin = ...)`.
+
+```{r styles}
+profils <- profils_combat(combats)
+styles  <- calculer_styles(profils, k = 4)
+combats <- ajouter_styles(combats, styles)
+
+# Effectifs et profil moyen (taux bruts) de chaque style
+styles %>%
+  group_by(style) %>%
+  summarise(combattants = n(),
+            across(all_of(vars_style), ~ round(mean(.x), 2)))
+```
+
+**Choix du nombre de groupes.** La silhouette mesure si chaque combattant est plus proche de son groupe que du groupe voisin (1 = groupes parfaitement séparés, 0 = à la frontière).
+
+```{r choix-k, message=FALSE}
+library(cluster)
+
+Z_styles <- as.matrix(select(filter(profils, eligible), starts_with("z_")))
+dist_styles <- dist(Z_styles)
+tibble(k = 2:6,
+       silhouette = sapply(2:6, function(k) {
+         set.seed(42)
+         km <- kmeans(Z_styles, centers = k, nstart = 25, iter.max = 100)
+         round(mean(silhouette(km$cluster, dist_styles)[, "sil_width"]), 3)
+       }))
+```
+
+La silhouette est la plus haute pour 2 groupes et baisse ensuite lentement ; toutes les valeurs restent faibles (autour de 0,2–0,3). Les styles ne forment donc pas des groupes nettement séparés mais un **continuum** : beaucoup de combattants sont mixtes. Deux groupes (en gros « frappeurs » contre « combattants au sol ») seraient trop grossiers pour notre question ; quatre groupes perdent peu en silhouette et correspondent aux grands profils du MMA. On retient 4 groupes, en interprétant le style comme une **tendance dominante** et non comme une étiquette exclusive.
+
+**Validation.** La méthode de victoire n'a pas servi à construire les styles ; si les styles ont un sens, elle doit pourtant varier fortement d'un style à l'autre.
+
+```{r validation-styles}
+methode <- case_when(grepl("KO", combats$method)       ~ "KO / TKO",
+                     combats$method == "Submission"    ~ "Soumission",
+                     grepl("Decision", combats$method) ~ "Décision",
+                     TRUE                              ~ "Autre")
+round(100 * prop.table(table(combats$style_gagnant, methode), margin = 1), 1)
+
+# Quelques combattants connus
+filter(styles, name %in% c("Khabib Nurmagomedov", "Islam Makhachev", "Georges St-Pierre",
+                           "Kamaru Usman", "Conor McGregor", "Israel Adesanya",
+                           "Francis Ngannou", "Justin Gaethje", "Charles Oliveira",
+                           "Demian Maia", "Jon Jones", "Stipe Miocic")) %>%
+  select(name, categorie, nb_combats, style)
 ```
 
 ## Statistiques descriptives
@@ -253,6 +423,9 @@ categorie_principale <- bind_rows(
 
 noeuds <- left_join(noeuds, categorie_principale, by = "name")
 
+# Style de combat (calculé dans la section « Styles de combat »)
+noeuds <- left_join(noeuds, select(styles, name, style), by = "name")
+
 # 4. Graphe orienté (multigraphe : une arête par combat, revanches comprises)
 g <- graph_from_data_frame(aretes, directed = TRUE, vertices = noeuds)
 
@@ -264,7 +437,7 @@ g_pondere <- simplify(g, remove.multiple = TRUE, remove.loops = TRUE,
 cat("Combattants (nœuds) :", vcount(g),
     "\nCombats (arêtes)    :", ecount(g),
     "\nDensité             :", round(edge_density(g_pondere), 5),
-    "\nComposantes faibles :", components(g, mode = "weak")$no, "\n")
+    "\nComposantes faibles :", igraph::components(g, mode = "weak")$no, "\n")
 
 # Les 10 combattants avec le plus de victoires
 noeuds %>% arrange(desc(victoires)) %>% head(10)
@@ -283,13 +456,13 @@ sous_graphe <- function(g, categorie = NULL, annees = NULL) {
   if (!is.null(categorie)) garder <- garder & E(g)$weight_class %in% categorie
   if (!is.null(annees))    garder <- garder & E(g)$annee %in% annees
   h <- delete_edges(g, which(!garder))
-  delete_vertices(h, which(degree(h) == 0))
+  delete_vertices(h, which(igraph::degree(h) == 0))
 }
 
 g_lw <- sous_graphe(g, categorie = "Lightweight", annees = 2021:2023) # sur un seul année pas assez de lien car que 2-3 combats par an -> étalé sur 3 ans
 
 set.seed(42)
-victoires_lw <- degree(g_lw, mode = "in")
+victoires_lw <- igraph::degree(g_lw, mode = "in")
 plot(g_lw,
      layout             = layout_with_fr(g_lw),
      vertex.size        = 3 + 3 * victoires_lw,
@@ -312,74 +485,115 @@ La taille et la couleur des nœuds suivent le **PageRank**. Comme les arêtes vo
 ```{r fonction-reseau, message=FALSE}
 library(visNetwork)
 
+# Couleurs fixes des styles (mêmes couleurs dans tous les graphes)
+couleurs_style <- c("Complet / polyvalent"   = "#2a78d6",
+                    "Frappeur KO"            = "#eb6834",
+                    "Lutteur / contrôle"     = "#1baf7a",
+                    "Spécialiste soumission" = "#eda100",
+                    "Indéterminé"            = "#b0b0b0")
+
 # Réseau interactif + centralités pour une catégorie et une période
 #   g         : graphe complet (perdant -> gagnant)
 #   categorie : une ou plusieurs catégories de poids, ex. "Lightweight"
 #   annees    : années retenues, ex. 2021:2023
 #   top       : nombre de combattants mis en évidence (PageRank)
-# Renvoie une liste : $graphe (sous-graphe igraph), $centralites (tableau), $vis (widget)
-reseau_interactif <- function(g, categorie, annees, top = 10) {
+#   couleur   : "pagerank" (top PageRank), "style" (style de combat)
+#               ou "communaute" (communautés détectées dans le sous-graphe)
+# Renvoie une liste : $graphe (sous-graphe igraph), $centralites (tableau),
+#                     $communautes (objet communities d'igraph), $vis (widget)
+reseau_interactif <- function(g, categorie, annees, top = 10,
+                              couleur = c("pagerank", "style", "communaute")) {
+  couleur <- match.arg(couleur)
   h  <- sous_graphe(g, categorie, annees)
   pr <- page_rank(h)$vector   # multi-arêtes (revanches) comptées comme poids
 
-  centralites <- tibble(name      = V(h)$name,
-                        victoires = degree(h, mode = "in"),
-                        defaites  = degree(h, mode = "out"),
-                        pagerank  = round(pr, 4),
-                        rang      = rank(-pr, ties.method = "first")) %>%
+  style <- if (is.null(V(h)$style)) rep("Indéterminé", vcount(h)) else as.character(V(h)$style)
+  style[is.na(style)] <- "Indéterminé"
+
+  # Communautés « sans a priori » : uniquement à partir de qui a combattu qui
+  communautes <- igraph::cluster_walktrap(h)
+
+  centralites <- tibble(name       = V(h)$name,
+                        victoires  = igraph::degree(h, mode = "in"),
+                        defaites   = igraph::degree(h, mode = "out"),
+                        pagerank   = round(pr, 4),
+                        rang       = rank(-pr, ties.method = "first"),
+                        style      = style,
+                        communaute = as.integer(igraph::membership(communautes))) %>%
     arrange(rang)
 
   groupe_top <- paste("Top", top, "PageRank")
+  groupe <- switch(couleur,
+                   pagerank   = if_else(centralites$rang <= top, groupe_top, "Autres combattants"),
+                   style      = centralites$style,
+                   communaute = paste("Communauté", centralites$communaute))
 
   noeuds_vis <- centralites %>%
     transmute(id    = name,
               label = name,
               value = pagerank,
-              group = if_else(rang <= top, groupe_top, "Autres combattants"),
+              group = groupe,
               title = paste0("<b>", name, "</b><br>",
                              "Victoires : ", victoires, "<br>",
                              "Défaites : ", defaites, "<br>",
-                             "PageRank : ", pagerank, " (rang ", rang, ")"))
+                             "PageRank : ", pagerank, " (rang ", rang, ")<br>",
+                             "Style : ", style, "<br>",
+                             "Communauté : ", communaute))
 
   aretes_vis <- igraph::as_data_frame(h, what = "edges") %>%
     transmute(from, to,
               title = paste0(to, " bat ", from, "<br>", event, " (", annee, ")<br>", method))
 
+  legende_couleur <- c(pagerank = "top PageRank", style = "style de combat",
+                       communaute = "communauté détectée")[[couleur]]
   titre <- paste0(paste(categorie, collapse = ", "), " ", min(annees), "–", max(annees),
-                  " : taille = PageRank, flèche vers le gagnant")
+                  " : taille = PageRank, couleur = ", legende_couleur,
+                  ", flèche vers le gagnant")
 
+  # Même graine de disposition quelle que soit la couleur : les nœuds restent au même endroit
   vis <- visNetwork(noeuds_vis, aretes_vis, height = "750px", width = "100%", main = titre) %>%
-    visIgraphLayout(layout = "layout_with_fr", randomSeed = 42) %>%
-    visGroups(groupname = groupe_top,           color = "#eb6834") %>%
-    visGroups(groupname = "Autres combattants", color = "#2a78d6") %>%
+    visIgraphLayout(layout = "layout_with_fr", randomSeed = 42)
+
+  if (couleur == "pagerank") {
+    vis <- vis %>%
+      visGroups(groupname = groupe_top,           color = "#eb6834") %>%
+      visGroups(groupname = "Autres combattants", color = "#2a78d6")
+  } else if (couleur == "style") {
+    for (s in intersect(names(couleurs_style), unique(groupe))) {
+      vis <- visGroups(vis, groupname = s, color = couleurs_style[[s]])
+    }
+  }  # communautés : couleurs par défaut de visNetwork (leur nombre varie)
+
+  vis <- vis %>%
     visNodes(scaling = list(min = 6, max = 40,
                             label = list(enabled = TRUE, min = 12, max = 28))) %>%
     visEdges(arrows = list(to = list(enabled = TRUE, scaleFactor = 0.4)),
              color  = list(color = "#c8c8c8", highlight = "#333333"),
              smooth = FALSE) %>%
     visOptions(highlightNearest = list(enabled = TRUE, degree = 1),
-               nodesIdSelection = list(enabled = TRUE, main = "Choisir un combattant")) %>%
-    visLegend(useGroups = TRUE, position = "right") %>%
+               nodesIdSelection = list(enabled = TRUE, main = "Choisir un combattant"),
+               selectedBy       = list(variable = "group", main = "Choisir un groupe")) %>%
     visInteraction(navigationButtons = TRUE)
+  if (couleur != "communaute") vis <- visLegend(vis, useGroups = TRUE, position = "right")
 
-  list(graphe = h, centralites = centralites, vis = vis)
+  list(graphe = h, centralites = centralites, communautes = communautes, vis = vis)
 }
 
 # Tableau triable et filtrable des centralités
 table_centralites <- function(centralites) {
   DT::datatable(centralites, rownames = FALSE,
-                colnames = c("Combattant", "Victoires", "Défaites", "PageRank", "Rang"),
+                colnames = c("Combattant", "Victoires", "Défaites", "PageRank", "Rang",
+                             "Style", "Communauté"),
                 options = list(pageLength = 15, order = list(list(4, "asc"))))
 }
 ```
 
 ```{r reseau-lightweight}
-lw <- reseau_interactif(g, "Lightweight", 2021:2023)
+lw <- reseau_interactif(g, "Lightweight", 2010:2023)
 lw$vis
 
-# Autre catégorie ou autre période : un appel suffit, par exemple
-# ww <- reseau_interactif(g, "Welterweight", 2018:2020)
-# ww$vis
+#ww <- reseau_interactif(g, "Welterweight", 2018:2020)
+#ww$vis
 ```
 
 Le tableau ci-dessous classe tous les combattants de la fenêtre par PageRank ; il se trie en cliquant sur une colonne et se filtre avec le champ de recherche.
@@ -388,3 +602,220 @@ Le tableau ci-dessous classe tous les combattants de la fenêtre par PageRank ; 
 table_centralites(lw$centralites)
 ```
 
+### Réseau coloré par style de combat
+
+Même réseau, mêmes positions des nœuds (même graine de disposition), mais la couleur indique maintenant le style de combat calculé plus haut. La liste « Choisir un groupe » permet d'isoler un style. Les styles sont ici calculés sur toute la carrière de chaque combattant, y compris après la fenêtre : c'est suffisant pour explorer, mais pour une analyse à une date précise il faudrait les recalculer sur la fenêtre (`profils_combat(combats, debut, fin)`).
+
+```{r reseau-style}
+lw_style <- reseau_interactif(g, "Lightweight", 2010:2023, couleur = "style")
+lw_style$vis
+```
+
+## Styles de combat et communautés du réseau
+
+Les styles ont été construits **à partir des statistiques de combat**, sans regarder le réseau. On fait maintenant l'inverse : une détection de communautés qui n'utilise **que le réseau** (qui a combattu qui), sans aucune information sur les combattants. C'est une classification « sans a priori ». Si les styles structuraient les affrontements (par exemple si les lutteurs combattaient surtout entre lutteurs), les communautés devraient en partie retrouver les styles.
+
+**Méthode de détection.** On utilise l'algorithme *walktrap* (`cluster_walktrap`) : des marches aléatoires courtes ont tendance à rester piégées dans les zones denses du réseau, qui forment les communautés. Il a trois avantages ici : il ignore le sens des arêtes (pour savoir qui affronte qui, peu importe qui a gagné), il gère les revanches (arêtes multiples) et il est déterministe (même résultat à chaque exécution, sans graine). La **modularité** mesure la qualité du découpage : proche de 0, pas plus de liens internes que le hasard ; au-delà de 0,3, structure en communautés marquée.
+
+**Mesures de comparaison.** Deux partitions des mêmes combattants (communautés et styles) sont comparées avec :
+
+- l'**information mutuelle normalisée (NMI)** : 0 = les deux partitions sont indépendantes, 1 = identiques ; elle a tendance à augmenter artificiellement quand il y a beaucoup de petites communautés ;
+- l'**indice de Rand ajusté (ARI)** : 0 = pas plus d'accord que le hasard, 1 = identiques ; il corrige l'effet du hasard et sert de garde-fou à la NMI.
+
+On compare aussi les communautés à la **catégorie de poids**, qui sert de témoin : les combattants n'affrontent que des adversaires de leur catégorie, les communautés devraient donc la retrouver.
+
+Enfin, l'**assortativité** par style mesure directement si les combats opposent plus souvent deux combattants du même style que ne le voudrait le hasard (0 = pas de préférence, > 0 = entre-soi, < 0 = affrontements entre styles différents).
+
+```{r communautes-global}
+# Comparaison de deux partitions, sur les combattants dont le style est déterminé
+comparer_partitions <- function(a, b) {
+  a <- as.integer(factor(a)); b <- as.integer(factor(b))
+  c(NMI = round(igraph::compare(a, b, method = "nmi"), 3),
+    ARI = round(igraph::compare(a, b, method = "adjusted.rand"), 3))
+}
+
+# Assortativité par style (combattants au style déterminé seulement)
+assortativite_style <- function(h) {
+  st  <- as.character(V(h)$style)
+  det <- which(!is.na(st) & st != "Indéterminé")
+  hd  <- igraph::induced_subgraph(h, det)
+  round(igraph::assortativity_nominal(hd, as.integer(factor(V(hd)$style)), directed = FALSE), 3)
+}
+
+comm_global <- igraph::cluster_walktrap(g)
+membre      <- igraph::membership(comm_global)
+style_g     <- as.character(V(g)$style)
+det_g       <- !is.na(style_g) & style_g != "Indéterminé"
+
+cat("Graphe complet :", length(comm_global), "communautés, modularité",
+    round(igraph::modularity(comm_global), 3), "\n")
+
+rbind("Communautés vs catégorie de poids" = comparer_partitions(membre, V(g)$categorie),
+      "Communautés vs style (styles déterminés)" =
+        comparer_partitions(membre[det_g], style_g[det_g]))
+
+cat("Assortativité par style (graphe complet) :", assortativite_style(g), "\n")
+```
+
+Sur le graphe complet, les communautés retrouvent nettement les catégories de poids, mais pas du tout les styles (NMI et ARI proches de 0), et l'assortativité par style est quasi nulle. Le réseau est structuré par la **catégorie de poids** (et dans une moindre mesure par l'époque), pas par le style : le matchmaking de l'UFC ne regroupe pas les combattants par style.
+
+Pour neutraliser l'effet de la catégorie et de l'époque, on refait la comparaison à l'intérieur d'une seule catégorie et d'une seule fenêtre.
+
+```{r communautes-lightweight}
+h_lw   <- lw_style$graphe
+comm_lw <- lw_style$communautes
+memb_lw <- igraph::membership(comm_lw)
+st_lw   <- as.character(V(h_lw)$style)
+det_lw  <- !is.na(st_lw) & st_lw != "Indéterminé"
+
+cat("Lightweight :", length(comm_lw), "communautés, modularité",
+    round(igraph::modularity(comm_lw), 3), "\n")
+comparer_partitions(memb_lw[det_lw], st_lw[det_lw])
+cat("Assortativité par style :", assortativite_style(h_lw), "\n")
+
+# Composition en styles des plus grandes communautés
+grandes <- as.integer(names(sort(table(memb_lw), decreasing = TRUE))[1:min(8, length(comm_lw))])
+table(Communaute = memb_lw[memb_lw %in% grandes], Style = st_lw[memb_lw %in% grandes])
+```
+
+```{r reseau-communautes}
+lw_comm <- reseau_interactif(g, "Lightweight", 2010:2023, couleur = "communaute")
+lw_comm$vis
+```
+
+Les deux graphes (couleur = style, couleur = communauté) ont la même disposition et peuvent être comparés directement. À l'intérieur d'une catégorie, les communautés correspondent surtout à des « générations » de combattants qui se sont affrontés à la même période ; chaque communauté mélange les styles. La NMI peut paraître moins faible qu'au niveau global, mais c'est un effet du grand nombre de petites communautés : l'ARI, qui corrige le hasard, reste proche de 0.
+
+**Conclusion.** Le style de combat ne structure pas le réseau des affrontements : on ne combat pas préférentiellement des adversaires de son style, et une classification sans a priori du réseau ne retrouve pas les styles. Le style reste en revanche une caractéristique utile des combattants (des nœuds) pour la suite : comparer le PageRank selon le style, et tester si les combattants sur-classés par l'UFC ont un style particulier.
+
+## Analyse stratifiée par catégorie de poids
+
+Les analyses précédentes portent soit sur le graphe complet, dominé par l'effet de la catégorie de poids, soit sur une seule catégorie (Lightweight). Une conclusion tirée d'une seule catégorie peut lui être propre. On refait donc les mêmes mesures **catégorie par catégorie** (stratification), sur la même fenêtre de temps, pour vérifier si les résultats sont généraux ou si certaines catégories se comportent différemment (par exemple les poids lourds, où le KO est plus fréquent).
+
+On ne garde que les catégories avec au moins 150 combats dans la fenêtre : en dessous (Catch Weight, Women's Featherweight…), les communautés et les corrélations sont trop instables pour être interprétées.
+
+Pour chaque catégorie, on calcule :
+
+- la taille du réseau (combattants, combats) et la part de combattants dont le style est déterminé ;
+- les communautés (walktrap) et leur modularité ;
+- l'accord entre communautés et **styles** (NMI, ARI) ;
+- l'accord entre communautés et **période** (année médiane des combats du combattant, regroupée par tranches de 3 ans), qui sert de témoin : si les communautés sont des « générations », cet accord doit être nettement plus fort que celui avec les styles ;
+- l'assortativité par style.
+
+```{r strates-fonctions}
+annees_strates <- 2010:2023   # même fenêtre que les graphes Lightweight ci-dessus
+
+# Année médiane des combats de chaque combattant dans un sous-graphe
+annee_mediane <- function(h) {
+  a <- igraph::as_data_frame(h, what = "edges")
+  bind_rows(select(a, name = from, annee), select(a, name = to, annee)) %>%
+    group_by(name) %>%
+    summarise(annee = median(annee), .groups = "drop")
+}
+
+# Une ligne d'indicateurs pour une catégorie
+analyse_categorie <- function(g, categorie, annees) {
+  h    <- sous_graphe(g, categorie, annees)
+  comm <- igraph::cluster_walktrap(h)
+  memb <- igraph::membership(comm)
+  st   <- as.character(V(h)$style)
+  st[is.na(st)] <- "Indéterminé"
+  det  <- st != "Indéterminé"
+  med  <- annee_mediane(h)
+  periode <- med$annee[match(V(h)$name, med$name)] %/% 3   # tranches de 3 ans
+
+  sty <- comparer_partitions(memb[det], st[det])
+  epo <- comparer_partitions(memb, periode)
+
+  tibble(categorie     = categorie,
+         combattants   = vcount(h),
+         combats       = ecount(h),
+         style_connu   = paste0(round(100 * mean(det)), " %"),
+         communautes   = length(comm),
+         modularite    = round(igraph::modularity(comm), 3),
+         NMI_style     = sty[["NMI"]],
+         ARI_style     = sty[["ARI"]],
+         NMI_periode   = epo[["NMI"]],
+         ARI_periode   = epo[["ARI"]],
+         assortativite = assortativite_style(h))
+}
+
+# Catégories retenues : au moins 150 combats dans la fenêtre
+cats_strates <- aretes %>%
+  filter(annee %in% annees_strates) %>%
+  count(weight_class, sort = TRUE) %>%
+  filter(n >= 150) %>%
+  pull(weight_class)
+```
+
+```{r strates-table}
+strates <- bind_rows(lapply(cats_strates, function(cat) analyse_categorie(g, cat, annees_strates)))
+
+DT::datatable(strates, rownames = FALSE,
+              colnames = c("Catégorie", "Combattants", "Combats", "Style connu",
+                           "Communautés", "Modularité", "NMI style", "ARI style",
+                           "NMI période", "ARI période", "Assortativité style"),
+              options = list(pageLength = 15, dom = "t"))
+```
+
+```{r strates-graphe, fig.width=9, fig.height=5}
+p_strates <- bind_rows(
+    transmute(strates, categorie, critere = "Style de combat", ARI = ARI_style),
+    transmute(strates, categorie, critere = "Période (3 ans)", ARI = ARI_periode)) %>%
+  ggplot(aes(ARI, reorder(categorie, ARI), colour = critere)) +
+  geom_vline(xintercept = 0, colour = "grey60") +
+  geom_point(size = 3) +
+  scale_colour_manual(values = c("Style de combat" = "#eb6834", "Période (3 ans)" = "#2a78d6")) +
+  labs(x = "Accord avec les communautés détectées (ARI, 0 = hasard)", y = NULL, colour = NULL,
+       title = "Les communautés reflètent la période, pas le style, dans chaque catégorie") +
+  theme_minimal() +
+  theme(legend.position = "top")
+ggplotly(p_strates)
+```
+
+Le résultat est le même dans toutes les catégories : l'accord entre communautés et styles est nul (ARI autour de 0, entre −0,03 et +0,04 dans nos tests) et l'assortativité par style reste proche de 0, y compris chez les poids lourds. L'accord avec la période est systématiquement plus élevé. La conclusion de la section précédente n'est donc pas propre à Lightweight : **dans aucune catégorie le style ne structure les affrontements**, qui s'organisent par génération de combattants.
+
+### PageRank selon le style, par catégorie
+
+Le style ne détermine pas *qui affronte qui*, mais il pourrait déterminer *qui gagne contre des adversaires solides*, donc la centralité. Pour chaque catégorie, on calcule le PageRank **relatif** de chaque combattant (PageRank × nombre de combattants : 1 = la moyenne de la catégorie), ce qui permet de comparer des catégories de tailles différentes, puis sa moyenne par style.
+
+Les combattants « Indéterminé » sont exclus : ils ont peu de combats et donc mécaniquement un PageRank faible. Pour la même raison, les quatre styles ont un PageRank relatif supérieur à 1 (il faut au moins 5 combats pour avoir un style) : on compare les styles **entre eux**, pas à 1. Un test de Kruskal-Wallis (comparaison de distributions, sans hypothèse de normalité, adapté au PageRank très asymétrique) indique pour chaque catégorie si les différences entre styles sont significatives.
+
+```{r strates-pagerank, fig.width=9, fig.height=5}
+pagerank_style <- bind_rows(lapply(cats_strates, function(cat) {
+  h  <- sous_graphe(g, cat, annees_strates)
+  st <- as.character(V(h)$style)
+  st[is.na(st)] <- "Indéterminé"
+  tibble(categorie  = cat,
+         name       = V(h)$name,
+         style      = st,
+         pr_relatif = page_rank(h)$vector * vcount(h))
+})) %>%
+  filter(style != "Indéterminé")
+
+# Moyenne par catégorie et style
+pr_moyen <- pagerank_style %>%
+  group_by(categorie, style) %>%
+  summarise(pr_relatif = round(mean(pr_relatif), 2), combattants = n(), .groups = "drop")
+
+# Test de Kruskal-Wallis par catégorie
+tests_style <- pagerank_style %>%
+  group_by(categorie) %>%
+  summarise(p_valeur = signif(kruskal.test(pr_relatif ~ factor(style))$p.value, 2),
+            .groups = "drop")
+tests_style
+
+p_pr <- ggplot(pr_moyen, aes(style, reorder(categorie, pr_relatif), fill = pr_relatif,
+                             text = paste0(categorie, "<br>", style, "<br>PageRank relatif moyen : ",
+                                           pr_relatif, "<br>", combattants, " combattants"))) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = pr_relatif), size = 3.2) +
+  scale_fill_gradient(low = "#e8f0fb", high = "#2a78d6") +
+  labs(x = NULL, y = NULL, fill = "PageRank\nrelatif",
+       title = "PageRank relatif moyen selon le style, par catégorie") +
+  theme_minimal()
+ggplotly(p_pr, tooltip = "text")
+```
+
+Dans nos tests, les **frappeurs KO** ont le PageRank relatif moyen le plus élevé dans la plupart des catégories masculines (en particulier Heavyweight, Middleweight, Bantamweight et Featherweight) ainsi qu'en Women's Strawweight, et les **spécialistes de la soumission** le plus faible. Les exceptions sont à commenter : en Lightweight et Welterweight les lutteurs font jeu égal avec les frappeurs KO, et en Flyweight les frappeurs KO sont au contraire en retrait. Deux précautions avant d'interpréter : une moyenne de PageRank peut être tirée par quelques champions (d'où le test de Kruskal-Wallis, fondé sur les rangs), et le style est calculé sur toute la carrière.
+
+Ce résultat est directement utile pour la comparaison avec le classement UFC : si les frappeurs KO sont déjà mieux placés **sportivement** (PageRank), leur présence dans le classement officiel ne suffit pas à prouver un biais en faveur des combattants « vendeurs ». Il faudra comparer, à PageRank égal, le rang UFC selon le style.

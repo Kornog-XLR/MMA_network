@@ -1,1 +1,3 @@
 https://www.kaggle.com/datasets/maksbasher/ufc-complete-dataset-all-events-1996-2024?resource=download
+
+Pour le ranking : https://www.kaggle.com/datasets/martj42/ufc-rankings
