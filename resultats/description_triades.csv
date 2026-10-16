@@ -1,0 +1,12 @@
+categorie,transitives,cycliques,triangles,part_cycliques
+Mouches (H),3,0,3,0
+Coqs (H),4,1,5,0.2
+Plumes (H),8,1,9,0.1111111111111111
+Légers (H),8,2,10,0.2
+Welters (H),8,0,8,0
+Moyens (H),8,3,11,0.2727272727272727
+Mi-lourds (H),6,5,11,0.45454545454545453
+Lourds (H),19,1,20,0.05
+Pailles (F),8,4,12,0.3333333333333333
+Mouches (F),5,1,6,0.16666666666666666
+Coqs (F),2,1,3,0.3333333333333333

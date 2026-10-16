@@ -1,0 +1,373 @@
+---
+title: "Description structurelle des réseaux de combats UFC"
+author: "Adrien et Nicolas"
+date: "2026-10-16"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+if (!file.exists("config.R")) {
+  stop("config.R introuvable : copiez config_exemple.R en config.R et indiquez votre chemin.")
+}
+source("config.R")
+knitr::opts_knit$set(root.dir = chemin_projet)
+```
+
+# Objet {-}
+
+Ce notebook décrit la **structure** des réseaux de combats avec les outils du cours :
+
+- **chapitre 3** : ordre, taille, densité, réciprocité, connexité, distance moyenne, diamètre, clustering, et les quatre centralités (degré, proximité, intermédiarité, vecteur propre) ;
+- **chapitre 4** : comparaison à un réseau aléatoire d'Erdős–Rényi de même taille (*small world*) et distribution des degrés.
+
+Il ajoute une mesure propre aux réseaux de victoires : la **cohérence de la hiérarchie**, mesurée par les triades. Dans un triangle de combats, les victoires peuvent être transitives (A bat B, B bat C et A bat C) ou cycliques (A bat B, B bat C, mais C bat A).
+
+Il est **descriptif** et indépendant de l'analyse pré-enregistrée (`comparaison_classements.Rmd`). Il en reprend le découpage : un réseau par catégorie de poids et par genre, sur la fenêtre de trois ans qui précède le 1er janvier 2024 (combats de 2021 à 2023). Cette fenêtre est la plus récente qui soit complète.
+
+**Orienté ou non orienté ?** Le réseau est par nature **orienté** : chaque arête va du perdant vers le gagnant. Les mesures qui portent sur la hiérarchie (réciprocité, composantes fortement connexes, triades, degrés entrant et sortant, PageRank) utilisent cette orientation. Les mesures qui portent sur « qui a affronté qui » (distance, diamètre, clustering, proximité, intermédiarité, vecteur propre) utilisent la version **non orientée** : deux combattants sont proches s'ils se sont affrontés, quel que soit le vainqueur.
+
+# Données
+
+```{r import}
+library(readr)
+library(dplyr)
+library(igraph)
+library(ggplot2)
+
+large_dataset <- read_csv("dataset_ufc/UFC dataset/Large set/large_dataset.csv", show_col_types = FALSE)
+evenements    <- read_csv("dataset_ufc/UFC dataset/Small set/completed_events_small.csv", show_col_types = FALSE)
+rankings_brut <- read_csv("dataset_ufc/UFC dataset/rankings_history.csv", show_col_types = FALSE,
+                          col_types = cols(date = col_date(), weightclass = col_character(),
+                                           fighter = col_character(), rank = col_integer()))
+
+# Même préparation que mma.Rmd
+categories <- c("Women's Strawweight", "Women's Flyweight", "Women's Bantamweight",
+                "Women's Featherweight", "Light Heavyweight", "Super Heavyweight",
+                "Heavyweight", "Middleweight", "Welterweight", "Lightweight",
+                "Featherweight", "Bantamweight", "Flyweight", "Catch Weight", "Open Weight")
+extraire_categorie <- function(x) {
+  m <- regexpr(paste(categories, collapse = "|"), x)
+  ifelse(m > 0, substr(x, m, m + attr(m, "match.length") - 1), "Open Weight")
+}
+combats <- large_dataset %>%
+  left_join(select(evenements, event_name = event, date), by = "event_name") %>%
+  mutate(gagnant      = if_else(winner == "Red", r_fighter, b_fighter),
+         perdant      = if_else(winner == "Red", b_fighter, r_fighter),
+         date         = parse_date(date, format = "%B %d, %Y", locale = locale("en")),
+         weight_class = extraire_categorie(weight_class))
+
+# Catégories disposant d'un classement officiel (mêmes que l'analyse principale)
+categories_analyse <- c("Flyweight", "Bantamweight", "Featherweight", "Lightweight", "Welterweight",
+                        "Middleweight", "Light Heavyweight", "Heavyweight",
+                        "Women's Strawweight", "Women's Flyweight", "Women's Bantamweight")
+noms_fr <- c("Flyweight" = "Mouches (H)", "Bantamweight" = "Coqs (H)", "Featherweight" = "Plumes (H)",
+             "Lightweight" = "Légers (H)", "Welterweight" = "Welters (H)", "Middleweight" = "Moyens (H)",
+             "Light Heavyweight" = "Mi-lourds (H)", "Heavyweight" = "Lourds (H)",
+             "Women's Strawweight" = "Pailles (F)", "Women's Flyweight" = "Mouches (F)",
+             "Women's Bantamweight" = "Coqs (F)")
+
+date_photo <- as.Date("2024-01-01")
+debut      <- as.Date("2021-01-01")
+
+# Classement officiel en vigueur au 1er janvier 2024 (dernier publié avant), noms harmonisés
+# avec la même règle que comparaison_classements.Rmd (paires connues + casse)
+paires_noms <- list(
+  c("Tecia Pennington", "Tecia Torres"), c("Ronaldo Souza", "Jacare Souza"),
+  c("Antonio Rogerio Nogueira", "Rogerio Nogueira"), c("King Green", "Bobby Green"),
+  c("Costas Philippou", "Constantinos Philippou"), c("Mara Borella", "Mara Romero Borella"),
+  c("Francisco Rivera Jr.", "Francisco Rivera"), c("Magomed Bibulatov", "Bibulatov Magomed"),
+  c("Cris Cyborg", "Cristiane Justino"), c("Ulka Sasaki", "Yuta Sasaki"),
+  c("Tim Johnson", "Timothy Johnson"), c("Junior dos Santos", "Junior Dos Santos"),
+  c("C.B. Dollaway", "CB Dollaway"))
+noms_combats <- unique(c(combats$gagnant, combats$perdant))
+harmoniser_noms <- function(x) {
+  for (p in paires_noms) { cible <- if (p[2] %in% noms_combats) p[2] else p[1]; x[x %in% p] <- cible }
+  minuscules <- tolower(noms_combats)
+  uniques    <- minuscules[!duplicated(minuscules) & !duplicated(minuscules, fromLast = TRUE)]
+  absents    <- !(x %in% noms_combats) & tolower(x) %in% uniques
+  x[absents] <- noms_combats[match(tolower(x[absents]), minuscules)]
+  x
+}
+classes_2024 <- rankings_brut %>%
+  filter(weightclass %in% categories_analyse, !is.na(fighter), fighter != "NA", date < date_photo) %>%
+  group_by(weightclass) %>% filter(date == max(date)) %>% ungroup() %>%
+  transmute(categorie = weightclass, name = harmoniser_noms(fighter), position = rank + 1L)
+```
+
+```{r reseaux}
+# Un réseau orienté par catégorie (perdant -> gagnant), combats de 2021 à 2023
+reseau <- function(categorie, debut, fin) {
+  a <- combats %>%
+    filter(weight_class == categorie, date >= debut, date < fin) %>%
+    transmute(from = perdant, to = gagnant)
+  graph_from_data_frame(a, directed = TRUE)
+}
+reseaux <- setNames(lapply(categories_analyse, reseau, debut = debut, fin = date_photo), categories_analyse)
+
+# Versions dérivées :
+#  - simple orienté   : un arc par paire et par sens (pour densité, réciprocité, triades)
+#  - non orienté      : un lien par paire de combattants qui se sont affrontés
+simple_oriente <- function(g) simplify(g, remove.multiple = TRUE, remove.loops = TRUE)
+non_oriente    <- function(g) simplify(as.undirected(g, mode = "collapse"))
+plus_grande_composante <- function(h) {
+  cp <- components(h, mode = "weak")
+  induced_subgraph(h, which(cp$membership == which.max(cp$csize)))
+}
+```
+
+# Indicateurs globaux par catégorie (chapitre 3)
+
+## Pourquoi
+
+Avant d'interpréter des centralités, il faut savoir quel réseau on décrit : sa taille, sa densité, s'il est d'un seul tenant, la distance qui sépare deux combattants. Ces indicateurs permettent aussi de comparer les catégories entre elles, puisque la densité et le clustering sont des proportions.
+
+**Choix de calcul :**
+
+- la **distance moyenne** et le **diamètre** sont calculés sur la plus grande composante du réseau non orienté. Le cours rappelle que la distance entre deux composantes est infinie ;
+- les versions **orientées** suivent les arcs perdant → gagnant : la distance orientée de A à B est le nombre minimal de défaites à remonter pour aller de A à B, calculé seulement sur les paires qu'on peut atteindre ;
+- la **réciprocité** est calculée en arcs, comme dans le cours : un arc est réciproque si les deux combattants se sont battus l'un l'autre pendant la fenêtre (revanche au résultat inversé).
+
+```{r indicateurs}
+indicateurs <- function(g) {
+  gs <- simple_oriente(g)
+  gu <- non_oriente(g)
+  gc <- plus_grande_composante(gu)
+  cf <- components(g, mode = "strong")
+  tibble(
+    combattants          = vcount(g),
+    combats              = ecount(g),
+    paires_distinctes    = ecount(gu),
+    degre_moyen          = 2 * ecount(g) / vcount(g),                 # combats par combattant
+    degre_max            = max(igraph::degree(g, mode = "all")),
+    victoires_max        = max(igraph::degree(g, mode = "in")),
+    densite_non_orientee = edge_density(gu),
+    densite_orientee     = edge_density(gs),
+    reciprocite          = reciprocity(gs),
+    composantes          = components(gu)$no,
+    part_plus_grande     = vcount(gc) / vcount(gu),
+    distance_moyenne     = mean_distance(gc, directed = FALSE),
+    diametre             = diameter(gc, directed = FALSE),
+    distance_moy_orientee = mean_distance(gs, directed = TRUE, unconnected = TRUE),
+    diametre_oriente     = diameter(gs, directed = TRUE, unconnected = TRUE),
+    clustering           = transitivity(gu, type = "global"),
+    comp_fortes          = cf$no,
+    plus_grande_forte    = max(cf$csize))
+}
+
+tableau_global <- bind_rows(lapply(categories_analyse, function(cat)
+  mutate(indicateurs(reseaux[[cat]]), categorie = noms_fr[cat]))) %>%
+  relocate(categorie)
+tableau_global %>% mutate(across(where(is.double), ~ round(.x, 3)))
+```
+
+**Lecture attendue.** Les réseaux sont très peu denses : chaque combattant n'affronte qu'une petite partie de sa catégorie. Les distances restent pourtant courtes, de l'ordre de 4 ou 5 combats, ce qui est typique d'un « petit monde ». La réciprocité est faible, puisqu'il faut une revanche au résultat inversé. Les composantes fortement connexes renseignent sur la hiérarchie : dans une hiérarchie parfaite, sans aucun cycle de victoires, chaque combattant formerait à lui seul sa composante forte.
+
+# Comparaison à un réseau aléatoire (chapitre 4)
+
+## Pourquoi
+
+Un clustering ou une distance ne disent rien seuls : il faut les comparer à ce que produirait le hasard avec le même nombre de combattants et de combats. On tire 200 réseaux d'Erdős–Rényi G(n, m) de même taille que chaque réseau non orienté observé, et on calcule le rapport entre le clustering observé et le clustering aléatoire, ainsi que celui des distances moyennes. L'indice *small world* vaut σ = (C / C_aléatoire) / (L / L_aléatoire). Un réseau est « petit monde » si son clustering est bien plus élevé qu'au hasard (σ > 1) pour une distance comparable.
+
+```{r aleatoire}
+set.seed(42)
+comparaison_aleatoire <- function(g, B = 200) {
+  gu <- non_oriente(g)
+  n <- vcount(gu); m <- ecount(gu)
+  sims <- replicate(B, {
+    r  <- sample_gnm(n, m)
+    rc <- plus_grande_composante(r)
+    c(C = transitivity(r, type = "global"), L = mean_distance(rc, directed = FALSE))
+  })
+  C_obs <- transitivity(gu, type = "global")
+  L_obs <- mean_distance(plus_grande_composante(gu), directed = FALSE)
+  tibble(C_observe = C_obs, C_aleatoire = mean(sims["C", ], na.rm = TRUE),
+         L_observee = L_obs, L_aleatoire = mean(sims["L", ], na.rm = TRUE)) %>%
+    mutate(rapport_C = C_observe / C_aleatoire,
+           rapport_L = L_observee / L_aleatoire,
+           sigma     = rapport_C / rapport_L)
+}
+tableau_aleatoire <- bind_rows(lapply(categories_analyse, function(cat)
+  mutate(comparaison_aleatoire(reseaux[[cat]]), categorie = noms_fr[cat]))) %>%
+  relocate(categorie)
+tableau_aleatoire %>% mutate(across(where(is.double), ~ round(.x, 3)))
+```
+
+## Distribution des degrés
+
+Le cours oppose deux formes de distribution des degrés : la loi de Poisson du réseau aléatoire et la loi de puissance des réseaux *scale free*. On trace la distribution du nombre de combats par combattant sur l'ensemble de la période (1994–2024, réseau complet), en échelle log-log, avec la loi de Poisson de même moyenne.
+
+```{r degres, fig.width=7, fig.height=4.2}
+g_complet <- graph_from_data_frame(transmute(combats, from = perdant, to = gagnant), directed = TRUE)
+deg <- igraph::degree(g_complet, mode = "all")
+distribution <- tibble(degre = deg) %>% count(degre) %>% mutate(part = n / sum(n))
+poisson <- tibble(degre = 1:max(deg)) %>% mutate(part = dpois(degre, mean(deg)) / (1 - dpois(0, mean(deg))))
+c(moyenne = mean(deg), mediane = median(deg), maximum = max(deg), un_seul_combat = mean(deg == 1))
+
+fig_degres <- ggplot(distribution, aes(degre, part)) +
+  geom_point(colour = "#2a78d6", size = 2) +
+  geom_line(data = filter(poisson, part > 1e-5), linetype = "dashed", colour = "grey35") +
+  scale_x_log10() + scale_y_log10(labels = function(x) paste0(signif(100 * x, 2), " %")) +
+  labs(x = "Nombre de combats à l'UFC (échelle logarithmique)", y = "Part des combattants (échelle log.)",
+       caption = "Points : distribution observée (2 472 combattants). Tirets : loi de Poisson de même moyenne.") +
+  theme_minimal(base_size = 11) + theme(panel.grid.minor = element_blank())
+fig_degres
+```
+
+# Cohérence de la hiérarchie : les triades
+
+## Pourquoi
+
+Dans un réseau de victoires, un triangle de combats peut être **transitif** (A bat B, B bat C et A bat C) ou **cyclique** (A bat B, B bat C, C bat A). Une compétition très hiérarchisée, où le meilleur bat toujours le moins bon, ne produirait que des triangles transitifs. Si les trois orientations étaient tirées au hasard, 2 configurations sur 8 seraient cycliques, soit 25 %. La part de triangles cycliques mesure donc à quel point le classement « par le réseau » est cohérent, et à quel point le PageRank peut ordonner les combattants sans contradiction.
+
+```{r triades}
+triades <- bind_rows(lapply(categories_analyse, function(cat) {
+  tc <- triad_census(simple_oriente(reseaux[[cat]]))   # 16 types (MAN) ; 9 = 030T, 10 = 030C
+  tibble(categorie = noms_fr[cat], transitives = tc[9], cycliques = tc[10])
+})) %>%
+  mutate(triangles = transitives + cycliques, part_cycliques = cycliques / triangles)
+triades
+
+# Toutes catégories : part de triangles cycliques comparée à 25 % (orientation au hasard)
+total <- summarise(triades, cycliques = sum(cycliques), triangles = sum(triangles))
+binom.test(total$cycliques, total$triangles, p = 0.25)
+```
+
+# Centralités des combattants (chapitre 3)
+
+## Pourquoi
+
+Les quatre dimensions de la centralité du cours ne mesurent pas la même chose dans un réseau de combats :
+
+| Centralité | Calculée sur | Interprétation ici |
+|---|---|---|
+| Degré entrant / sortant | Orienté | Nombre de victoires / de défaites dans la fenêtre |
+| Degré total | Non orienté | Activité : nombre d'adversaires différents |
+| Proximité | Non orienté, plus grande composante | Nombre moyen de combats qui séparent le combattant de tous les autres |
+| Intermédiarité | Non orienté | Rôle de « pont » entre des groupes de combattants qui ne se sont pas affrontés |
+| Vecteur propre | Non orienté | Avoir affronté des adversaires eux-mêmes très connectés |
+| PageRank | Orienté | Avoir battu des adversaires qui ont eux-mêmes battu des adversaires solides (§2.3 du mémoire) |
+
+On calcule ces centralités pour chaque combattant de chaque catégorie, puis :
+
+1. on mesure leurs **corrélations de rang** : en particulier, la valeur sportive (PageRank) se confond-elle avec la simple activité (degré) ?
+2. on **compare les combattants classés et non classés** au 1er janvier 2024, comme le cours recommande de comparer la centralité de groupes.
+
+```{r centralites}
+centralites <- function(cat) {
+  g  <- reseaux[[cat]]
+  gu <- non_oriente(g)
+  gc <- plus_grande_composante(gu)
+  prox <- closeness(gc, normalized = TRUE)          # inverse de la distance moyenne aux autres
+  tibble(name          = V(g)$name,
+         categorie     = noms_fr[cat],
+         victoires     = igraph::degree(g, mode = "in"),
+         defaites      = igraph::degree(g, mode = "out"),
+         adversaires   = igraph::degree(gu)[V(g)$name],
+         proximite     = unname(prox[V(g)$name]),   # NA hors de la plus grande composante
+         intermediarite = betweenness(gu, normalized = TRUE)[V(g)$name],
+         vecteur_propre = eigen_centrality(gu)$vector[V(g)$name],
+         pagerank      = page_rank(g, damping = 0.85)$vector) %>%
+    left_join(filter(classes_2024, categorie == cat) %>% select(name, position), by = "name") %>%
+    mutate(classe = !is.na(position))
+}
+tab_centralites <- bind_rows(lapply(categories_analyse, centralites))
+
+# Corrélations de Spearman entre centralités (calculées dans chaque catégorie, puis médiane)
+mesures <- c("victoires", "adversaires", "proximite", "intermediarite", "vecteur_propre", "pagerank")
+correlations <- bind_rows(lapply(split(tab_centralites, tab_centralites$categorie), function(d) {
+  m <- cor(d[mesures], method = "spearman", use = "pairwise.complete.obs")
+  as.data.frame(as.table(m), stringsAsFactors = FALSE) %>% rename(mesure_1 = Var1, mesure_2 = Var2, rho = Freq)
+})) %>%
+  group_by(mesure_1, mesure_2) %>% summarise(rho_median = median(rho), .groups = "drop")
+matrice_correlations <- xtabs(rho_median ~ mesure_1 + mesure_2, data = correlations)[mesures, mesures]
+round(matrice_correlations, 2)
+```
+
+```{r classes-vs-non-classes}
+# Classés (au 1er janvier 2024) vs non classés : médianes et test de Wilcoxon, toutes catégories
+comparaison_groupes <- bind_rows(lapply(mesures, function(v) {
+  x <- tab_centralites[[v]][tab_centralites$classe]
+  y <- tab_centralites[[v]][!tab_centralites$classe]
+  tibble(mesure = v, mediane_classes = median(x, na.rm = TRUE), mediane_non_classes = median(y, na.rm = TRUE),
+         p_valeur = wilcox.test(x, y, exact = FALSE)$p.value)
+}))
+comparaison_groupes
+count(tab_centralites, classe)
+
+# Les 10 combattants les plus centraux des poids légers selon chaque mesure
+legers <- filter(tab_centralites, categorie == "Légers (H)")
+sapply(mesures, function(v) head(legers$name[order(-legers[[v]])], 5))
+```
+
+# Visualisation de deux réseaux
+
+On représente deux catégories contrastées pour la fenêtre 2021–2023 :
+
+- les **poids légers (hommes)** : la plus grande catégorie, où la concordance avec le classement officiel est la plus faible ;
+- les **poids pailles (femmes)** : une catégorie plus petite, où la concordance est parmi les plus fortes.
+
+La taille d'un nœud est proportionnelle à son PageRank. Les combattants classés au 1er janvier 2024 sont en couleur, avec leur nom et leur position officielle. Chaque flèche va du perdant vers le gagnant. Seule la plus grande composante est représentée.
+
+```{r fonction-dessin}
+dessiner <- function(cat, titre, graine = 42) {
+  g  <- reseaux[[cat]]
+  cp <- components(g, mode = "weak")
+  h  <- induced_subgraph(g, which(cp$membership == which.max(cp$csize)))
+  h  <- simplify(h, remove.multiple = TRUE, remove.loops = TRUE)
+  pr <- page_rank(h, damping = 0.85)$vector
+  pos <- classes_2024 %>% filter(categorie == cat)
+  position <- pos$position[match(V(h)$name, pos$name)]
+  set.seed(graine)
+  plot(h,
+       layout             = layout_with_fr(h),
+       # taille ~ PageRank (au moins 6 pour les classés, pour que le numéro reste lisible)
+       vertex.size        = ifelse(is.na(position), 2 + 60 * sqrt(pr), pmax(6, 2 + 60 * sqrt(pr))),
+       vertex.color       = ifelse(is.na(position), "#c9d3df", "#eb6834"),
+       vertex.frame.color = ifelse(is.na(position), NA, "white"),
+       # position officielle inscrite dans le nœud (les noms se chevaucheraient au centre)
+       vertex.label       = ifelse(is.na(position), NA, position),
+       vertex.label.cex   = 0.7,
+       vertex.label.font  = 2,
+       vertex.label.color = "white",
+       edge.arrow.size    = 0.15,
+       edge.color         = adjustcolor("grey45", alpha.f = 0.5),
+       main = titre)
+}
+```
+
+```{r legende-classes}
+# Légende des numéros : classement officiel au 1er janvier 2024
+classes_2024 %>% filter(categorie %in% c("Lightweight", "Women's Strawweight")) %>%
+  arrange(categorie, position) %>% mutate(categorie = noms_fr[categorie])
+```
+
+```{r graphe-legers, fig.width=10, fig.height=9}
+dessiner("Lightweight", "Poids légers (hommes), combats 2021–2023")
+```
+
+```{r graphe-pailles, fig.width=9, fig.height=8}
+dessiner("Women's Strawweight", "Poids pailles (femmes), combats 2021–2023")
+```
+
+# Export
+
+```{r export}
+dir.create("resultats/figures", showWarnings = FALSE, recursive = TRUE)
+write_csv(tableau_global,     "resultats/description_indicateurs_globaux.csv")
+write_csv(tableau_aleatoire,  "resultats/description_comparaison_aleatoire.csv")
+write_csv(triades,            "resultats/description_triades.csv")
+write_csv(comparaison_groupes, "resultats/description_classes_vs_non_classes.csv")
+write_csv(as_tibble(as.data.frame.matrix(round(matrice_correlations, 3)), rownames = "mesure"),
+          "resultats/description_correlations_centralites.csv")
+
+ggsave("resultats/figures/distribution_degres.png", fig_degres, width = 7, height = 4.2, dpi = 200, bg = "white")
+png("resultats/figures/reseau_legers_2021_2023.png", width = 2000, height = 1800, res = 200)
+dessiner("Lightweight", ""); dev.off()
+png("resultats/figures/reseau_pailles_2021_2023.png", width = 1800, height = 1600, res = 200)
+dessiner("Women's Strawweight", ""); dev.off()
+```

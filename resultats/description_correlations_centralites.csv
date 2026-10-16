@@ -1,0 +1,7 @@
+mesure,victoires,adversaires,proximite,intermediarite,vecteur_propre,pagerank
+victoires,1,0.784,0.563,0.715,0.568,0.935
+adversaires,0.784,1,0.807,0.938,0.841,0.712
+proximite,0.563,0.807,1,0.798,0.923,0.507
+intermediarite,0.715,0.938,0.798,1,0.737,0.664
+vecteur_propre,0.568,0.841,0.923,0.737,1,0.568
+pagerank,0.935,0.712,0.507,0.664,0.568,1
