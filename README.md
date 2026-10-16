@@ -7,6 +7,7 @@ Réseau orienté des combats UFC : chaque nœud est un combattant, chaque combat
 ## Contenu
 
 - `mma.Rmd` : analyse (import, construction du graphe, sous-graphes par catégorie de poids et par période).
+- `comparaison_classements.Rmd` : analyse **pré-enregistrée** (écrite avant exécution) de la comparaison classement officiel UFC / PageRank : hypothèses H1 à H4, robustesse, export des tables dans `resultats/`.
 - `dataset_ufc/UFC dataset/` : données UFC 1994–2024.
   - `Large set/large_dataset.csv` : une ligne par combat, colonne `winner` (`Red` / `Blue`) — utilisé pour le graphe.
   - `Small set/completed_events_small.csv` : date de chaque événement (jointure par nom d'événement).

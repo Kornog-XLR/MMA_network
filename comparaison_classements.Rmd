@@ -1,0 +1,783 @@
+---
+title: "Classement officiel UFC vs PageRank : analyse pré-enregistrée"
+author: "Adrien et Nicolas"
+date: "Écrit le 2026-10-16, avant toute exécution"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Chemin du projet propre à chaque machine : défini dans config.R (ignoré par git).
+if (!file.exists("config.R")) {
+  stop("config.R introuvable : copiez config_exemple.R en config.R et indiquez votre chemin.")
+}
+source("config.R")
+knitr::opts_knit$set(root.dir = chemin_projet)
+```
+
+# Objet de ce notebook {-}
+
+Ce notebook met en œuvre la **partie 2 (cadre méthodologique)** du mémoire (`../redaction/memoire.md`). Il répond aux quatre questions de recherche :
+
+| Question | Hypothèse | Section |
+|---|---|---|
+| Q1 — Le classement officiel concorde-t-il avec le PageRank ? | **H1** : concordance partielle, meilleure en haut du classement | 5 |
+| Q2 — Les écarts sont-ils liés au style, à la manière de gagner, à l'activité, à l'ancienneté ? | **H2** : les combattants spectaculaires (KO) sont sur-classés, les lutteurs sous-classés | 6 |
+| Q4 — La concordance varie-t-elle selon les catégories ? | **H4** : plus faible dans les catégories peu fournies, notamment féminines | 7 |
+| Q3 — Quel classement prédit le mieux les combats suivants ? | **H3** (exploratoire) : le PageRank prédit au moins aussi bien | 8 |
+
+**Statut : analyse pré-enregistrée.** Ce notebook a été écrit le 16/10/2026 **sans être exécuté**, pour que les choix d'analyse soient fixés avant de connaître les résultats. Pour chaque analyse, on écrit à l'avance la raison, la méthode, les **résultats attendus** sous l'hypothèse et le **critère de décision**. Toute modification faite après la première exécution doit être consignée dans la section 10, « Journal des écarts au plan », avec sa raison.
+
+Le notebook est autonome : il refait l'import et la préparation des données, avec exactement le même code que `mma.Rmd`, qui reste le notebook exploratoire du projet.
+
+**Seuil de significativité** : 5 % pour tous les tests.
+
+# Paramètres de l'analyse
+
+Tous les choix de la méthodologie sont regroupés ici. Ils ne doivent pas être modifiés après avoir vu les résultats, sauf dans la section 9 (robustesse), qui les fait varier un par un.
+
+```{r parametres}
+P <- list(
+  fenetre_ans           = 3,      # fenêtre du réseau : 3 ans avant la date de comparaison (§2.2)
+  amortissement         = 0.85,   # paramètre d du PageRank (§2.3)
+  dates_photo           = as.Date(paste0(2014:2024, "-01-01")),  # une photo par an (§2.2)
+  mois_actif            = 18,     # « actif » = un combat UFC dans les 18 mois avant la date (§2.4)
+  top_zone              = 5,      # haut du classement = champion + 4 premiers prétendants (H1)
+  seuil_illustration    = 5,      # écart ≥ 5 places : seulement pour citer des exemples (§2.4)
+  min_classes_par_photo = 10,     # photo retenue si au moins 10 classés ont un PageRank
+  horizon_prediction    = 365,    # H3 : combats dans les 365 jours suivant la photo (§2.7)
+  k_styles              = 4,      # nombre de styles (§2.5)
+  graine                = 42      # graine aléatoire (k-moyennes)
+)
+```
+
+**Règle d'inclusion des photos.** Une catégorie à une date donnée (une « photo ») n'est analysée que si au moins 10 combattants classés y ont un PageRank. C'est la condition minimale pour qu'une corrélation de rangs ait un sens. Cette règle est mécanique et fixée avant l'analyse ; elle remplace la décision 1.3 de la feuille de route, « catégories retenues : à voir ».
+
+# Import des données
+
+Trois fichiers, tous issus de Kaggle (voir `README.md`) :
+
+- `large_dataset.csv` : une ligne par combat UFC, de 1994 au 23/03/2024, avec les statistiques des deux combattants ;
+- `completed_events_small.csv` : la date de chaque événement ;
+- `rankings_history.csv` : l'historique des classements officiels, du 04/02/2013 au 02/06/2026, presque chaque semaine.
+
+```{r import}
+library(readr)
+library(dplyr)
+library(igraph)
+library(ggplot2)
+
+large_dataset <- read_csv("dataset_ufc/UFC dataset/Large set/large_dataset.csv", show_col_types = FALSE)
+evenements    <- read_csv("dataset_ufc/UFC dataset/Small set/completed_events_small.csv", show_col_types = FALSE)
+rankings_brut <- read_csv("dataset_ufc/UFC dataset/rankings_history.csv", show_col_types = FALSE,
+                          col_types = cols(date = col_date(), weightclass = col_character(),
+                                           fighter = col_character(), rank = col_integer()))
+```
+
+# Préparation des données
+
+## Combats
+
+Même traitement que dans `mma.Rmd` : vainqueur et perdant, date de l'événement, catégorie nettoyée. On ajoute deux variables utiles ici :
+
+- le **genre** du combat ;
+- la **manière de gagner**, regroupée en trois modalités : KO (KO/TKO, y compris arrêt médical), soumission et décision des juges (unanime, partagée ou majoritaire). Les disqualifications sont classées « Autre ».
+
+```{r preparation-combats}
+categories <- c("Women's Strawweight", "Women's Flyweight", "Women's Bantamweight",
+                "Women's Featherweight", "Light Heavyweight", "Super Heavyweight",
+                "Heavyweight", "Middleweight", "Welterweight", "Lightweight",
+                "Featherweight", "Bantamweight", "Flyweight", "Catch Weight",
+                "Open Weight")
+
+# "UFC Interim Lightweight Title" -> "Lightweight", "UFC 4 Tournament Title" -> "Open Weight"
+extraire_categorie <- function(x) {
+  m <- regexpr(paste(categories, collapse = "|"), x)
+  ifelse(m > 0, substr(x, m, m + attr(m, "match.length") - 1), "Open Weight")
+}
+
+combats <- large_dataset %>%
+  left_join(select(evenements, event_name = event, date), by = "event_name") %>%
+  mutate(gagnant      = if_else(winner == "Red", r_fighter, b_fighter),
+         perdant      = if_else(winner == "Red", b_fighter, r_fighter),
+         date         = parse_date(date, format = "%B %d, %Y", locale = locale("en")),
+         annee        = as.integer(format(date, "%Y")),
+         intitule     = weight_class,
+         weight_class = extraire_categorie(weight_class),
+         genre        = recode(gender, Men = "Hommes", Women = "Femmes"),
+         maniere      = case_when(
+           method %in% c("KO/TKO", "TKO - Doctor's Stoppage") ~ "KO",
+           method == "Submission"                             ~ "Soumission",
+           grepl("^Decision", method)                         ~ "Décision",
+           TRUE                                               ~ "Autre"))
+
+# Contrôle : chaque combat doit avoir une date (jointure complète attendue : 683/683 événements)
+stopifnot(!any(is.na(combats$date)))
+```
+
+## Participations
+
+Une ligne par combattant et par combat (chaque combat compte deux fois : une victoire, une défaite). Cette table sert à mesurer l'activité, la manière de gagner, l'ancienneté et la date du dernier combat.
+
+```{r participations}
+participations <- bind_rows(
+  combats %>% transmute(name = gagnant, date, weight_class, maniere, resultat = "V"),
+  combats %>% transmute(name = perdant, date, weight_class, maniere, resultat = "D"))
+
+# Date du premier combat UFC de chaque combattant (pour l'ancienneté)
+premiers_combats <- participations %>%
+  group_by(name) %>%
+  summarise(premier_combat = min(date), .groups = "drop")
+
+date_fin_donnees <- max(combats$date)   # 23 mars 2024
+```
+
+## Classements officiels
+
+Traitements, dans l'ordre :
+
+1. retrait des classements *pound-for-pound* (toutes catégories), hors sujet ;
+2. retrait de *Women's Featherweight*, souvent réduit au seul champion ;
+3. retrait des titres vacants (`fighter == "NA"`) ;
+4. passage du rang officiel (champion = 0) à une **position** de 1 à 16 (champion = 1) ;
+5. harmonisation des noms avec ceux des combats : les 13 correspondances identifiées dans `journal.md`, puis une correspondance sans tenir compte des majuscules.
+
+```{r preparation-classements}
+categories_hors_analyse <- c("Pound-for-Pound", "Men's Pound-for-Pound",
+                             "Women's Pound-for-Pound", "Women's Featherweight")
+
+# Paires de noms désignant le même combattant (journal.md, 07/10/2026).
+# Le sens n'est pas imposé : on garde la graphie présente dans les combats.
+paires_noms <- list(
+  c("Tecia Pennington", "Tecia Torres"),     c("Ronaldo Souza", "Jacare Souza"),
+  c("Antonio Rogerio Nogueira", "Rogerio Nogueira"), c("King Green", "Bobby Green"),
+  c("Costas Philippou", "Constantinos Philippou"),   c("Mara Borella", "Mara Romero Borella"),
+  c("Francisco Rivera Jr.", "Francisco Rivera"),     c("Magomed Bibulatov", "Bibulatov Magomed"),
+  c("Cris Cyborg", "Cristiane Justino"),     c("Ulka Sasaki", "Yuta Sasaki"),
+  c("Tim Johnson", "Timothy Johnson"),       c("Junior dos Santos", "Junior Dos Santos"),
+  c("C.B. Dollaway", "CB Dollaway"))
+
+noms_combats <- unique(c(combats$gagnant, combats$perdant))
+
+harmoniser_noms <- function(x) {
+  # 1. paires connues : on remplace par la graphie qui existe dans les combats
+  for (p in paires_noms) {
+    cible <- if (p[2] %in% noms_combats) p[2] else p[1]
+    x[x %in% p] <- cible
+  }
+  # 2. correspondance insensible à la casse, si elle est unique
+  minuscules <- tolower(noms_combats)
+  uniques    <- minuscules[!duplicated(minuscules) & !duplicated(minuscules, fromLast = TRUE)]
+  absents    <- !(x %in% noms_combats) & tolower(x) %in% uniques
+  x[absents] <- noms_combats[match(tolower(x[absents]), minuscules)]
+  x
+}
+
+classements <- rankings_brut %>%
+  filter(!weightclass %in% categories_hors_analyse, fighter != "NA", !is.na(fighter),
+         !is.na(rank)) %>%                               # rang illisible : ligne écartée
+  transmute(date_classement = date,
+            categorie       = weightclass,
+            fighter         = harmoniser_noms(fighter),
+            position        = rank + 1L)          # champion : 0 -> 1
+
+categories_analyse <- sort(unique(classements$categorie))
+categories_analyse
+```
+
+**Contrôle de la correspondance des noms.** Les combattants classés avant la fin des données de combats (23/03/2024) qui n'ont aucun combat sous le même nom sont listés. On s'attend à une poignée de cas (journal : 97,9 % des lignes correspondaient avant corrections).
+
+```{r controle-noms}
+classements %>%
+  filter(date_classement <= date_fin_donnees, !fighter %in% noms_combats) %>%
+  count(fighter, sort = TRUE)
+```
+
+## Limite connue : l'homonyme « Bruno Silva »
+
+Deux combattants différents portent ce nom (un poids moyen et un poids mouche). Le réseau étant construit catégorie par catégorie, ils y sont bien séparés. En revanche, leur style serait calculé sur leurs combats mélangés : on leur attribue donc le style « Indéterminé » (section 6).
+
+# Fonctions communes
+
+Chaque fonction correspond à une étape de la méthodologie. Elles sont paramétrées pour pouvoir être réutilisées telles quelles dans les analyses de robustesse (section 9).
+
+```{r fonctions-reseau}
+# Date située `ans` années (ou `mois` mois) avant `d`
+moins_ans  <- function(d, ans)  seq(d, by = paste0("-", ans, " years"),  length.out = 2)[2]
+moins_mois <- function(d, mois) seq(d, by = paste0("-", mois, " months"), length.out = 2)[2]
+
+# §2.2 — Réseau d'une catégorie sur la fenêtre [date - ans, date[ : arêtes perdant -> gagnant.
+# simple = TRUE : un seul lien par paire de combattants (variante de robustesse).
+reseau_fenetre <- function(categorie, date_photo, ans = P$fenetre_ans, simple = FALSE) {
+  aretes <- combats %>%
+    filter(weight_class == categorie,
+           date >= moins_ans(date_photo, ans), date < date_photo) %>%
+    transmute(from = perdant, to = gagnant)
+  if (nrow(aretes) == 0) return(NULL)
+  h <- graph_from_data_frame(aretes, directed = TRUE)
+  if (simple) h <- simplify(h, remove.multiple = TRUE, remove.loops = TRUE)
+  h
+}
+
+# §2.3 — PageRank de chaque combattant du sous-réseau (revanches = arêtes multiples)
+table_pagerank <- function(h, d = P$amortissement) {
+  tibble(name      = V(h)$name,
+         pagerank  = page_rank(h, damping = d, directed = TRUE)$vector,
+         victoires = igraph::degree(h, mode = "in"),
+         defaites  = igraph::degree(h, mode = "out")) %>%
+    mutate(nb_combats = victoires + defaites)
+}
+
+# §2.4 — Dernier classement officiel publié avant la date de la photo (NULL s'il n'y en a pas)
+classement_a_la_date <- function(categorie, date_photo, classements = get("classements")) {
+  dates <- classements$date_classement[classements$categorie == categorie &
+                                         classements$date_classement < date_photo]
+  if (length(dates) == 0) return(NULL)
+  classements %>%
+    filter(categorie == !!categorie, date_classement == max(dates))
+}
+
+# §2.4 — Combattants « actifs » : au moins un combat UFC (toutes catégories)
+# dans les `mois` précédant la date
+actifs_a_la_date <- function(date_photo, mois = P$mois_actif) {
+  participations %>%
+    filter(date >= moins_mois(date_photo, mois), date < date_photo) %>%
+    distinct(name) %>%
+    pull(name)
+}
+```
+
+```{r fonction-comparaison}
+# §2.4 — Comparaison classement officiel / PageRank pour une catégorie et une date.
+# Renvoie une liste :
+#   $resume : une ligne (corrélations, Jaccard, taille du réseau, indicateurs pour H1 et H4)
+#   $ecarts : une ligne par combattant classé ayant un PageRank (rangs et écart de rang)
+comparer_photo <- function(categorie, date_photo,
+                           ans = P$fenetre_ans, d = P$amortissement, simple = FALSE,
+                           min_combats = 1, classements = get("classements")) {
+  officiel <- classement_a_la_date(categorie, date_photo, classements)
+  h        <- reseau_fenetre(categorie, date_photo, ans, simple)
+  if (is.null(officiel) || is.null(h)) return(NULL)
+
+  pr <- table_pagerank(h, d)
+
+  # Classés ayant un PageRank (au moins `min_combats` combat(s) dans la fenêtre)
+  classes <- officiel %>%
+    inner_join(pr, by = c("fighter" = "name")) %>%
+    filter(nb_combats >= min_combats) %>%
+    mutate(rang_officiel = rank(position,  ties.method = "average"),  # parmi les classés
+           rang_pr       = rank(-pagerank, ties.method = "average"),  # parmi les classés
+           ecart         = rang_pr - rang_officiel)                   # > 0 : sur-classé
+
+  retenue <- nrow(classes) >= P$min_classes_par_photo
+
+  # Composition du haut du classement : top PageRank parmi les actifs vs liste officielle
+  actifs <- actifs_a_la_date(date_photo)
+  top_pr <- pr %>%
+    filter(name %in% actifs) %>%
+    arrange(desc(pagerank)) %>%
+    head(nrow(officiel)) %>%
+    pull(name)
+  jaccard <- length(intersect(top_pr, officiel$fighter)) /
+             length(union(top_pr, officiel$fighter))
+
+  resume <- tibble(
+    categorie        = categorie,
+    genre            = if_else(grepl("^Women's", categorie), "Femmes", "Hommes"),
+    date_photo       = date_photo,
+    date_classement  = max(officiel$date_classement),
+    n_classes        = nrow(officiel),
+    n_classes_pr     = nrow(classes),
+    retenue          = retenue,
+    spearman         = if (retenue) cor(classes$rang_officiel, classes$rang_pr, method = "spearman") else NA_real_,
+    kendall          = if (retenue) cor(classes$rang_officiel, classes$rang_pr, method = "kendall")  else NA_real_,  # tau-b
+    jaccard          = jaccard,
+    n_noeuds         = vcount(h),
+    n_combats        = ecount(h),
+    part_peu_combats = mean(classes$nb_combats <= 2),
+    ecart_abs_haut   = mean(abs(classes$ecart[classes$rang_officiel <= P$top_zone])),
+    ecart_abs_reste  = mean(abs(classes$ecart[classes$rang_officiel >  P$top_zone])))
+
+  list(resume = resume,
+       ecarts = classes %>% mutate(categorie = categorie, date_photo = date_photo))
+}
+
+# Applique comparer_photo à toutes les catégories et toutes les dates
+comparer_tout <- function(dates = P$dates_photo, ...) {
+  res <- list()
+  for (cat in categories_analyse) {
+    for (k in seq_along(dates)) {
+      r <- comparer_photo(cat, dates[k], ...)
+      if (!is.null(r)) res[[length(res) + 1]] <- r
+    }
+  }
+  list(resume = bind_rows(lapply(res, `[[`, "resume")),
+       ecarts = bind_rows(lapply(res, `[[`, "ecarts")))
+}
+```
+
+# H1 — Concordance entre classement officiel et PageRank
+
+## Pourquoi
+
+C'est la question centrale du mémoire (Q1). Si le classement officiel reflétait fidèlement la hiérarchie sportive inscrite dans le réseau des combats, les deux ordres seraient très proches. On mesure cette proximité à chaque date, dans chaque catégorie, et on regarde si l'accord est meilleur en haut du classement.
+
+## Méthode
+
+- **Ordre des classés** : corrélations de Spearman (ρ) et de Kendall (τ-b) entre le rang officiel et le rang PageRank, recalculés parmi les seuls classés ayant un PageRank.
+- **Composition** : indice de Jaccard entre la liste officielle et les combattants actifs de plus fort PageRank, en nombre égal. Il est comparable aux valeurs de Castillo et al. (2025) : 0,15 à 0,54 pour le top 15, le plus souvent entre 0,3 et 0,45.
+- **Haut contre reste du classement** : écart de rang absolu moyen pour le champion et les 4 premiers prétendants, comparé à celui des positions 6 à 16, par un test de Wilcoxon apparié sur les photos.
+
+## Résultats attendus (H1)
+
+- ρ et τ **positifs et significativement supérieurs à 0** dans la plupart des catégories : les deux classements ne sont pas sans rapport ;
+- mais **nettement inférieurs à 1** (médiane de ρ attendue en dessous de 0,8) : la concordance n'est que partielle ;
+- un écart absolu **plus faible dans le haut du classement** que dans le reste.
+
+**Critère de décision.** H1 est soutenue si la médiane de ρ est comprise entre 0 et 0,8, si elle est significativement positive (test de Wilcoxon unilatéral, toutes photos confondues) et si l'écart absolu est significativement plus faible dans le haut du classement. Si ρ est supérieur à 0,8 dans la plupart des catégories, l'hypothèse de départ (les deux classements ne correspondent pas) est rejetée.
+
+## Calcul
+
+```{r h1-calcul}
+principal <- comparer_tout()
+resume    <- principal$resume
+ecarts    <- principal$ecarts
+
+# Photos retenues / exclues (règle des 10 classés avec PageRank)
+resume %>% count(categorie, retenue)
+
+resume_ret <- filter(resume, retenue)
+```
+
+```{r h1-tableau}
+# Tableau 4.1 (prévu) : concordance par catégorie
+concordance_categorie <- resume_ret %>%
+  group_by(genre, categorie) %>%
+  summarise(photos          = n(),
+            rho_median      = median(spearman),
+            rho_q1          = quantile(spearman, 0.25),
+            rho_q3          = quantile(spearman, 0.75),
+            tau_median      = median(kendall),
+            jaccard_median  = median(jaccard),
+            # test unilatéral : rho > 0 (peu de photos par catégorie : à lire avec prudence)
+            p_rho_positif   = if (n() >= 5) wilcox.test(spearman, mu = 0, alternative = "greater",
+                                                        exact = FALSE)$p.value else NA_real_,
+            .groups = "drop") %>%
+  arrange(genre, desc(rho_median))
+concordance_categorie
+
+# Vue d'ensemble, toutes photos confondues
+resume_ret %>%
+  summarise(photos = n(),
+            rho_median = median(spearman), tau_median = median(kendall),
+            jaccard_median = median(jaccard),
+            part_rho_sup_0_8 = mean(spearman > 0.8))
+
+wilcox.test(resume_ret$spearman, mu = 0, alternative = "greater", exact = FALSE)
+```
+
+```{r h1-zones}
+# Haut du classement (champion + 4) vs positions 6 à 16 : test apparié sur les photos
+zones <- filter(resume_ret, !is.na(ecart_abs_haut), !is.na(ecart_abs_reste))
+zones %>% summarise(ecart_haut_median = median(ecart_abs_haut),
+                    ecart_reste_median = median(ecart_abs_reste))
+wilcox.test(zones$ecart_abs_haut, zones$ecart_abs_reste, paired = TRUE,
+            alternative = "less", exact = FALSE)
+```
+
+```{r h1-figure, fig.width=10, fig.height=6}
+# Figure 4.1 (prévue) : évolution de rho par catégorie
+ggplot(resume_ret, aes(as.integer(format(date_photo, "%Y")), spearman)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_line(colour = "#2a78d6") + geom_point(colour = "#2a78d6") +
+  facet_wrap(~ categorie, ncol = 4) +
+  coord_cartesian(ylim = c(-0.5, 1)) +
+  labs(x = "Année de la photo (1er janvier)", y = "Corrélation de Spearman",
+       title = "Concordance entre classement officiel et PageRank, par catégorie") +
+  theme_minimal()
+```
+
+# H2 — Qui est sur-classé ou sous-classé, et pourquoi ?
+
+## Pourquoi
+
+Une concordance partielle peut venir d'erreurs aléatoires, sans portée particulière, ou d'écarts systématiques. L'hypothèse du mémoire est que le classement des journalistes avantage les combattants les plus spectaculaires et les plus vendeurs. On relie donc l'écart de rang aux caractéristiques des combattants.
+
+## Méthode
+
+- **Variable expliquée** : écart de rang = rang PageRank − rang officiel. Un écart positif signifie que le classement officiel place le combattant plus haut que le réseau (sur-classé).
+- **Variables explicatives**, mesurées sur la même fenêtre de 3 ans :
+  - le style de combat, recalculé sur la fenêtre pour ne pas utiliser d'information future ;
+  - la part des victoires par KO, par soumission et par décision ;
+  - l'activité (nombre de combats) ;
+  - l'ancienneté à l'UFC.
+- **Unité d'analyse** : le couple combattant × catégorie, avec l'écart moyen sur toutes les photos où il est classé, car un même combattant apparaît à plusieurs dates.
+- **Tests** :
+  - Kruskal-Wallis selon le style, puis Wilcoxon deux à deux avec correction de Holm ;
+  - corrélation de Spearman pour les variables continues ;
+  - régression linéaire exploratoire avec toutes les variables.
+
+## Résultats attendus (H2)
+
+- écart moyen des **frappeurs KO > 0**, et supérieur à celui des **lutteurs / contrôle**, dont l'écart moyen est attendu < 0 ;
+- corrélation **positive** entre l'écart et la **part des victoires par KO**, et **négative** avec la part des victoires par décision.
+
+**Critère de décision.** H2 est soutenue si le test de Kruskal-Wallis est significatif et que la comparaison frappeurs KO / lutteurs va dans le sens attendu (Wilcoxon, après correction de Holm), ou si la corrélation entre l'écart et la part des victoires par KO est significativement positive. Sinon, les écarts sont considérés comme non expliqués par le style de combat.
+
+*Remarque.* Le notebook exploratoire (`mma.Rmd`, analyse stratifiée) suggère que les frappeurs KO ont déjà un PageRank relatif plus élevé dans la plupart des catégories masculines. L'écart de rang compare les deux classements entre eux : un PageRank élevé n'implique donc pas un écart positif.
+
+## Calcul
+
+### Styles à chaque date
+
+```{r h2-fonctions-styles}
+# Fonctions de mma.Rmd (section « Styles de combat »), reprises à l'identique
+vars_style <- c("frappes_min", "kd_15", "amenees_15", "part_controle", "soumissions_15")
+
+profils_combat <- function(combats, debut = NULL, fin = NULL,
+                           min_combats = 5, min_minutes = 45,
+                           min_par_categorie = 20) {
+  if (!is.null(debut)) combats <- filter(combats, date >= debut)
+  if (!is.null(fin))   combats <- filter(combats, date <  fin)
+  combats <- mutate(combats, duree_sec = (finish_round - 1) * 300 + time_sec)
+  cote <- function(prefixe) {
+    combats %>%
+      transmute(name      = .data[[paste0(prefixe, "_fighter")]],
+                weight_class, duree_sec,
+                sig_str   = .data[[paste0(prefixe, "_sig_str")]],
+                kd        = .data[[paste0(prefixe, "_kd")]],
+                td        = .data[[paste0(prefixe, "_td")]],
+                ctrl_sec  = .data[[paste0(prefixe, "_ctrl_sec")]],
+                sub_att   = .data[[paste0(prefixe, "_sub_att")]])
+  }
+  profils <- bind_rows(cote("r"), cote("b")) %>%
+    group_by(name) %>%
+    summarise(categorie   = names(which.max(table(weight_class))),
+              nb_combats  = n(),
+              minutes     = sum(duree_sec) / 60,
+              sig_str     = sum(sig_str), kd = sum(kd), td = sum(td),
+              ctrl_sec    = sum(ctrl_sec), sub_att = sum(sub_att),
+              .groups = "drop") %>%
+    mutate(frappes_min    = sig_str / minutes,
+           kd_15          = kd / minutes * 15,
+           amenees_15     = td / minutes * 15,
+           part_controle  = ctrl_sec / (minutes * 60),
+           soumissions_15 = sub_att / minutes * 15,
+           eligible       = nb_combats >= min_combats & minutes >= min_minutes)
+  elig    <- filter(profils, eligible)
+  globale <- scale(as.matrix(elig[vars_style]))
+  elig <- elig %>%
+    group_by(categorie) %>%
+    mutate(n_categorie = n(),
+           across(all_of(vars_style), ~ (.x - mean(.x)) / sd(.x), .names = "z_{.col}")) %>%
+    ungroup()
+  petites <- elig$n_categorie < min_par_categorie
+  Z <- as.matrix(elig[paste0("z_", vars_style)])
+  Z[petites, ] <- globale[petites, ]
+  elig[paste0("z_", vars_style)] <- as.data.frame(Z)
+  profils %>%
+    left_join(select(elig, name, n_categorie, starts_with("z_")), by = "name")
+}
+
+calculer_styles <- function(profils, k = 4, graine = 42) {
+  elig <- filter(profils, eligible)
+  Z    <- as.matrix(select(elig, starts_with("z_")))
+  set.seed(graine)
+  km <- kmeans(Z, centers = k, nstart = 25, iter.max = 100)
+  centres <- km$centers
+  noms <- paste("Style", seq_len(k))
+  if (k == 4) {
+    reste <- seq_len(k)
+    j <- reste[which.max(centres[reste, "z_soumissions_15"])]
+    noms[j] <- "Spécialiste soumission"; reste <- setdiff(reste, j)
+    j <- reste[which.max(centres[reste, "z_amenees_15"] + centres[reste, "z_part_controle"])]
+    noms[j] <- "Lutteur / contrôle";     reste <- setdiff(reste, j)
+    j <- reste[which.max(centres[reste, "z_kd_15"])]
+    noms[j] <- "Frappeur KO";            reste <- setdiff(reste, j)
+    noms[reste] <- "Complet / polyvalent"
+  }
+  elig$style <- noms[km$cluster]
+  niveaux <- c(sort(unique(noms)), "Indéterminé")
+  profils %>%
+    left_join(select(elig, name, style), by = "name") %>%
+    mutate(style = factor(coalesce(style, "Indéterminé"), levels = niveaux))
+}
+```
+
+```{r h2-styles-par-photo}
+# Style de chaque combattant à chaque date, calculé sur la fenêtre de 3 ans qui précède
+styles_photo <- bind_rows(lapply(P$dates_photo, function(dp) {
+  profils <- profils_combat(combats, debut = moins_ans(dp, P$fenetre_ans), fin = dp)
+  calculer_styles(profils, k = P$k_styles, graine = P$graine) %>%
+    transmute(name, style = as.character(style), date_photo = dp)
+})) %>%
+  # Homonyme : deux combattants différents mélangés -> style non interprétable
+  mutate(style = if_else(name == "Bruno Silva", "Indéterminé", style))
+```
+
+### Caractéristiques à chaque date
+
+```{r h2-caracteristiques}
+# Manière de gagner et activité, dans la catégorie et sur la fenêtre de la photo
+caracteristiques_photo <- function(categorie, date_photo, ans = P$fenetre_ans) {
+  participations %>%
+    filter(weight_class == categorie,
+           date >= moins_ans(date_photo, ans), date < date_photo) %>%
+    group_by(name) %>%
+    summarise(activite        = n(),
+              n_victoires     = sum(resultat == "V"),
+              part_ko         = sum(resultat == "V" & maniere == "KO")         / n_victoires,
+              part_soumission = sum(resultat == "V" & maniere == "Soumission") / n_victoires,
+              part_decision   = sum(resultat == "V" & maniere == "Décision")   / n_victoires,
+              .groups = "drop") %>%
+    # sans victoire dans la fenêtre, les parts ne sont pas définies
+    mutate(across(starts_with("part_"), ~ if_else(n_victoires == 0, NA_real_, .x)),
+           categorie = categorie, date_photo = date_photo)
+}
+
+photos_retenues <- distinct(resume_ret, categorie, date_photo)
+caracteristiques <- bind_rows(lapply(seq_len(nrow(photos_retenues)), function(i)
+  caracteristiques_photo(photos_retenues$categorie[i], photos_retenues$date_photo[i])))
+
+ecarts_h2 <- ecarts %>%
+  semi_join(photos_retenues, by = c("categorie", "date_photo")) %>%
+  left_join(caracteristiques, by = c("fighter" = "name", "categorie", "date_photo")) %>%
+  left_join(styles_photo,     by = c("fighter" = "name", "date_photo")) %>%
+  left_join(premiers_combats, by = c("fighter" = "name")) %>%
+  mutate(style      = coalesce(style, "Indéterminé"),
+         anciennete = as.numeric(date_photo - premier_combat) / 365.25)
+```
+
+### Une ligne par combattant (et par catégorie)
+
+```{r h2-par-combattant}
+mode_valeur <- function(x) names(which.max(table(x)))   # modalité la plus fréquente
+
+par_combattant <- ecarts_h2 %>%
+  group_by(fighter, categorie) %>%
+  summarise(photos          = n(),
+            ecart_moyen     = mean(ecart),
+            style           = mode_valeur(style),
+            part_ko         = mean(part_ko,         na.rm = TRUE),
+            part_soumission = mean(part_soumission, na.rm = TRUE),
+            part_decision   = mean(part_decision,   na.rm = TRUE),
+            activite        = mean(activite),
+            anciennete      = mean(anciennete),
+            .groups = "drop") %>%
+  mutate(across(starts_with("part_"), ~ if_else(is.nan(.x), NA_real_, .x)))
+
+h2 <- filter(par_combattant, style != "Indéterminé")
+count(h2, style)
+```
+
+### Tests
+
+```{r h2-tests}
+# Tableau 4.2 (prévu) : écart moyen selon le style
+h2 %>%
+  group_by(style) %>%
+  summarise(combattants = n(), ecart_median = median(ecart_moyen),
+            ecart_moyen = mean(ecart_moyen), .groups = "drop")
+
+kruskal.test(ecart_moyen ~ factor(style), data = h2)
+pairwise.wilcox.test(h2$ecart_moyen, h2$style, p.adjust.method = "holm", exact = FALSE)
+
+# Corrélations de Spearman avec les variables continues
+variables_continues <- c("part_ko", "part_soumission", "part_decision", "activite", "anciennete")
+bind_rows(lapply(variables_continues, function(v) {
+  t <- cor.test(h2$ecart_moyen, h2[[v]], method = "spearman", exact = FALSE)
+  tibble(variable = v, rho = unname(t$estimate), p_valeur = t$p.value)
+}))
+```
+
+```{r h2-regression}
+# Régression exploratoire : effet de chaque variable à autres variables égales.
+# part_decision est exclue : avec part_ko et part_soumission, elle somme presque à 1 (colinéarité).
+# Référence du style : « Complet / polyvalent ».
+h2_reg <- mutate(h2, style = relevel(factor(style), ref = "Complet / polyvalent"))
+modele <- lm(ecart_moyen ~ style + part_ko + part_soumission + activite + anciennete, data = h2_reg)
+summary(modele)
+```
+
+```{r h2-figure, fig.width=8, fig.height=4.5}
+# Figure 4.2 (prévue) : distribution de l'écart moyen selon le style
+ggplot(h2, aes(reorder(style, ecart_moyen, FUN = median), ecart_moyen)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_boxplot(fill = "#cfe0f5", outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.3, size = 1) +
+  coord_flip() +
+  labs(x = NULL, y = "Écart de rang moyen (> 0 : sur-classé par le classement officiel)",
+       title = "Écart entre classement officiel et PageRank selon le style de combat") +
+  theme_minimal()
+```
+
+### Exemples (illustration uniquement)
+
+```{r h2-exemples}
+# Combattants le plus souvent sur-classés / sous-classés d'au moins 5 places
+ecarts_h2 %>%
+  mutate(sens = case_when(ecart >=  P$seuil_illustration ~ "Sur-classé",
+                          ecart <= -P$seuil_illustration ~ "Sous-classé")) %>%
+  filter(!is.na(sens)) %>%
+  count(sens, fighter, categorie, style, sort = TRUE) %>%
+  group_by(sens) %>% slice_head(n = 10) %>% ungroup()
+```
+
+# H4 — La concordance varie-t-elle selon les catégories ?
+
+## Pourquoi
+
+Si le PageRank est fragile dans les petits réseaux, une faible concordance pourrait venir du réseau plutôt que du classement officiel. On vérifie donc si la concordance dépend de la taille du réseau et du nombre de combats des classés, et si elle diffère entre hommes et femmes.
+
+## Méthode
+
+- comparaison des ρ entre catégories féminines et masculines (Wilcoxon, sur les photos) ;
+- corrélation de Spearman entre ρ et la taille du réseau (nombre de combattants) ;
+- corrélation de Spearman entre ρ et la part des classés ayant au plus deux combats dans la fenêtre.
+
+## Résultats attendus (H4)
+
+- ρ **plus faible chez les femmes** ;
+- ρ **croissant avec la taille du réseau** et **décroissant avec la part de classés peu actifs**.
+
+**Critère de décision.** H4 est soutenue si au moins l'une des deux corrélations est significative dans le sens attendu. Si la concordance est indépendante de la taille du réseau, les écarts observés en H1 ne s'expliquent pas par la fragilité du PageRank, ce qui renforce l'interprétation de H1 et H2.
+
+```{r h4}
+resume_ret %>%
+  group_by(genre) %>%
+  summarise(photos = n(), rho_median = median(spearman), noeuds_median = median(n_noeuds))
+
+wilcox.test(spearman ~ genre, data = resume_ret, exact = FALSE)
+
+cor.test(resume_ret$spearman, resume_ret$n_noeuds,         method = "spearman", exact = FALSE)
+cor.test(resume_ret$spearman, resume_ret$part_peu_combats, method = "spearman", exact = FALSE)
+```
+
+```{r h4-figure, fig.width=7, fig.height=4.5}
+# Figure 4.3 (prévue) : concordance et taille du réseau
+ggplot(resume_ret, aes(n_noeuds, spearman, colour = genre)) +
+  geom_point() +
+  scale_colour_manual(values = c(Hommes = "#2a78d6", Femmes = "#eb6834")) +
+  labs(x = "Combattants dans le réseau de la fenêtre", y = "Corrélation de Spearman",
+       colour = NULL, title = "Concordance selon la taille du réseau") +
+  theme_minimal()
+```
+
+# H3 (exploratoire) — Quel classement prédit le mieux les combats suivants ?
+
+## Pourquoi
+
+Faute de « vraie » hiérarchie connue, les combats qui suivent la publication d'un classement offrent un critère extérieur aux deux classements. C'est la démarche de Radicchi (2011).
+
+## Méthode
+
+Pour chaque photo, on garde les combats des 365 jours suivants, dans la même catégorie, entre deux combattants classés ayant tous deux un PageRank. Chaque classement désigne un favori : le mieux classé pour le classement officiel, le plus fort PageRank pour le réseau. On compare la part de favoris victorieux, puis on applique le test de McNemar sur les combats où les deux classements désignent un favori différent. Les photos de 2024 sont exclues, car les données de combats s'arrêtent en mars 2024.
+
+## Résultats attendus (H3)
+
+- une part de favoris victorieux d'environ 60 à 70 % pour les deux classements, ce qui est habituel dans les sports de combat ;
+- un taux pour le PageRank **au moins égal** à celui du classement officiel.
+
+**Critère de décision.** On conclut que le PageRank prédit au moins aussi bien si son taux de réussite n'est pas significativement inférieur (McNemar). Avec peu de combats discordants, seule une différence marquée sera détectable : **toute conclusion reste exploratoire**.
+
+```{r h3}
+predictions <- ecarts %>%
+  semi_join(filter(photos_retenues, date_photo < as.Date("2024-01-01")),
+            by = c("categorie", "date_photo")) %>%
+  select(categorie, date_photo, fighter, rang_officiel, pagerank)
+
+combats_suivants <- bind_rows(lapply(split(predictions, list(predictions$categorie, predictions$date_photo), drop = TRUE),
+  function(p) {
+    cat_p <- p$categorie[1]; dp <- p$date_photo[1]
+    combats %>%
+      filter(weight_class == cat_p, date >= dp, date < dp + P$horizon_prediction,
+             gagnant %in% p$fighter, perdant %in% p$fighter) %>%
+      transmute(categorie = cat_p, date_photo = dp, date, gagnant, perdant) %>%
+      left_join(select(p, fighter, rang_g = rang_officiel, pr_g = pagerank), by = c("gagnant" = "fighter")) %>%
+      left_join(select(p, fighter, rang_p = rang_officiel, pr_p = pagerank), by = c("perdant" = "fighter"))
+  })) %>%
+  # le favori a gagné si le vainqueur était le mieux classé (ex aequo exclus)
+  filter(rang_g != rang_p, pr_g != pr_p) %>%
+  mutate(officiel_juste = rang_g < rang_p,
+         pagerank_juste = pr_g > pr_p)
+
+combats_suivants %>%
+  summarise(combats = n(),
+            reussite_officiel = mean(officiel_juste),
+            reussite_pagerank = mean(pagerank_juste),
+            discordants = sum(officiel_juste != pagerank_juste))
+
+# Intervalles de confiance à 95 % des taux de réussite
+binom.test(sum(combats_suivants$officiel_juste), nrow(combats_suivants))$conf.int
+binom.test(sum(combats_suivants$pagerank_juste), nrow(combats_suivants))$conf.int
+
+# Test de McNemar sur les mêmes combats
+mcnemar.test(table(factor(combats_suivants$officiel_juste, levels = c(TRUE, FALSE)),
+                   factor(combats_suivants$pagerank_juste, levels = c(TRUE, FALSE))))
+```
+
+# Robustesse
+
+## Pourquoi
+
+Plusieurs choix de la méthode sont en partie arbitraires : la longueur de la fenêtre, le paramètre du PageRank, le traitement des revanches, l'inclusion des combattants peu actifs et la date de comparaison. On refait l'analyse H1 en changeant **un seul choix à la fois**.
+
+## Résultats attendus
+
+Les conclusions de H1 sont robustes si la médiane de ρ reste du même ordre (écart inférieur à 0,1) et du même côté du seuil de 0,8 dans toutes les variantes.
+
+```{r robustesse}
+resumer <- function(res, variante) {
+  res$resume %>%
+    filter(retenue) %>%
+    summarise(variante = variante, photos = n(),
+              rho_median = median(spearman), tau_median = median(kendall),
+              jaccard_median = median(jaccard))
+}
+
+robustesse <- bind_rows(
+  resumer(principal,                             "Principale (3 ans, d = 0,85, multigraphe)"),
+  resumer(comparer_tout(ans = 2),                "Fenêtre de 2 ans"),
+  resumer(comparer_tout(ans = 5),                "Fenêtre de 5 ans"),
+  resumer(comparer_tout(d = 0.5),                "PageRank d = 0,5"),
+  resumer(comparer_tout(d = 0.95),               "PageRank d = 0,95"),
+  resumer(comparer_tout(simple = TRUE),          "Un lien par paire (revanches ignorées)"),
+  resumer(comparer_tout(min_combats = 2),        "Classés avec au moins 2 combats"))
+robustesse
+```
+
+```{r robustesse-hebdo}
+# Classement hebdomadaire : toutes les dates de classement entre 2014 et la fin des données de combats.
+# Long à calculer (environ 500 dates x 11 catégories).
+dates_hebdo <- sort(unique(classements$date_classement))
+dates_hebdo <- dates_hebdo[dates_hebdo >= as.Date("2014-01-01") & dates_hebdo <= date_fin_donnees] + 1
+hebdo <- comparer_tout(dates = dates_hebdo)
+bind_rows(robustesse, resumer(hebdo, "Classement hebdomadaire"))
+```
+
+# Export des résultats pour la rédaction
+
+Les tables sont écrites dans `resultats/`, pour être reprises dans le mémoire sans recopier les chiffres à la main.
+
+```{r export}
+dir.create("resultats", showWarnings = FALSE)
+write_csv(resume,                "resultats/concordance_par_photo.csv")
+write_csv(concordance_categorie, "resultats/concordance_par_categorie.csv")
+write_csv(ecarts_h2,             "resultats/ecarts_par_photo.csv")
+write_csv(par_combattant,        "resultats/ecarts_par_combattant.csv")
+write_csv(combats_suivants,      "resultats/h3_combats_suivants.csv")
+write_csv(robustesse,            "resultats/robustesse.csv")
+```
+
+# Journal des écarts au plan
+
+Toute modification de ce notebook faite **après sa première exécution** est consignée ici : date, ce qui a changé, pourquoi. Les corrections de bugs qui ne changent pas la méthode (faute de frappe, erreur de jointure) sont aussi notées, en précisant qu'elles ne modifient pas les choix d'analyse.
+
+| Date | Modification | Raison |
+|---|---|---|
+| — | — | — |
