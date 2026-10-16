@@ -234,11 +234,11 @@ table_pagerank <- function(h, d = P$amortissement) {
 }
 
 # §2.4 — Dernier classement officiel publié avant la date de la photo (NULL s'il n'y en a pas)
-classement_a_la_date <- function(categorie, date_photo, classements = get("classements")) {
-  dates <- classements$date_classement[classements$categorie == categorie &
-                                         classements$date_classement < date_photo]
+classement_a_la_date <- function(categorie, date_photo, tab_classements = classements) {
+  dates <- tab_classements$date_classement[tab_classements$categorie == categorie &
+                                             tab_classements$date_classement < date_photo]
   if (length(dates) == 0) return(NULL)
-  classements %>%
+  tab_classements %>%
     filter(categorie == !!categorie, date_classement == max(dates))
 }
 
@@ -259,8 +259,8 @@ actifs_a_la_date <- function(date_photo, mois = P$mois_actif) {
 #   $ecarts : une ligne par combattant classé ayant un PageRank (rangs et écart de rang)
 comparer_photo <- function(categorie, date_photo,
                            ans = P$fenetre_ans, d = P$amortissement, simple = FALSE,
-                           min_combats = 1, classements = get("classements")) {
-  officiel <- classement_a_la_date(categorie, date_photo, classements)
+                           min_combats = 1, tab_classements = classements) {
+  officiel <- classement_a_la_date(categorie, date_photo, tab_classements)
   h        <- reseau_fenetre(categorie, date_photo, ans, simple)
   if (is.null(officiel) || is.null(h)) return(NULL)
 
@@ -307,8 +307,10 @@ comparer_photo <- function(categorie, date_photo,
        ecarts = classes %>% mutate(categorie = categorie, date_photo = date_photo))
 }
 
-# Applique comparer_photo à toutes les catégories et toutes les dates
-comparer_tout <- function(dates = P$dates_photo, ...) {
+# Applique comparer_photo à toutes les catégories et toutes les dates.
+# `dates` est placé après `...` : il doit être nommé en entier (sinon R associerait
+# par correspondance partielle l'argument `d` du PageRank à `dates`).
+comparer_tout <- function(..., dates = P$dates_photo) {
   res <- list()
   for (cat in categories_analyse) {
     for (k in seq_along(dates)) {
@@ -753,11 +755,12 @@ robustesse
 
 ```{r robustesse-hebdo}
 # Classement hebdomadaire : toutes les dates de classement entre 2014 et la fin des données de combats.
-# Long à calculer (environ 500 dates x 11 catégories).
+# Long à calculer : environ 400 dates x 11 catégories, soit 4 à 5 minutes.
 dates_hebdo <- sort(unique(classements$date_classement))
 dates_hebdo <- dates_hebdo[dates_hebdo >= as.Date("2014-01-01") & dates_hebdo <= date_fin_donnees] + 1
 hebdo <- comparer_tout(dates = dates_hebdo)
-bind_rows(robustesse, resumer(hebdo, "Classement hebdomadaire"))
+robustesse <- bind_rows(robustesse, resumer(hebdo, "Classement hebdomadaire"))
+robustesse
 ```
 
 # Export des résultats pour la rédaction
@@ -780,4 +783,6 @@ Toute modification de ce notebook faite **après sa première exécution** est c
 
 | Date | Modification | Raison |
 |---|---|---|
-| — | — | — |
+| 2026-10-16 | `classement_a_la_date()` et `comparer_photo()` : argument `classements = get("classements")` renommé `tab_classements = classements` | Bug : référence récursive à l'argument par défaut (erreur « promesse déjà en cours d'évaluation »). Aucun changement de méthode. |
+| 2026-10-16 | `comparer_tout()` : l'argument `dates` est placé après `...` | Bug : par correspondance partielle, `comparer_tout(d = 0.5)` passait 0,5 comme `dates`. Aucun changement de méthode. |
+| 2026-10-16 | Robustesse hebdomadaire : le résultat est ajouté à la table `robustesse` avant l'export | Bug : la ligne « Classement hebdomadaire » était affichée mais pas exportée. Aucun changement de méthode. |
