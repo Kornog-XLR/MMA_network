@@ -23,7 +23,7 @@ knitr::opts_knit$set(root.dir = chemin_projet)
 Ce notebook décrit la **structure** des réseaux de combats avec les outils du cours :
 
 - **chapitre 3** : ordre, taille, densité, réciprocité, connexité, distance moyenne, diamètre, clustering, et les quatre centralités (degré, proximité, intermédiarité, vecteur propre) ;
-- **chapitre 4** : comparaison à un réseau aléatoire d'Erdős–Rényi de même taille (*small world*) et distribution des degrés.
+- **chapitre 4** : distribution des degrés, comparaison à un réseau *scale-free* (Barabási–Albert) puis à un modèle hybride (Jackson et Rogers).
 
 Il ajoute une mesure propre aux réseaux de victoires : la **cohérence de la hiérarchie**, mesurée par les triades. Dans un triangle de combats, les victoires peuvent être transitives (A bat B, B bat C et A bat C) ou cycliques (A bat B, B bat C, mais C bat A).
 
@@ -167,55 +167,209 @@ tableau_global %>% mutate(across(where(is.double), ~ round(.x, 3)))
 
 **Lecture attendue.** Les réseaux sont très peu denses : chaque combattant n'affronte qu'une petite partie de sa catégorie. Les distances restent pourtant courtes, de l'ordre de 4 ou 5 combats, ce qui est typique d'un « petit monde ». La réciprocité est faible, puisqu'il faut une revanche au résultat inversé. Les composantes fortement connexes renseignent sur la hiérarchie : dans une hiérarchie parfaite, sans aucun cycle de victoires, chaque combattant formerait à lui seul sa composante forte.
 
-# Comparaison à un réseau aléatoire (chapitre 4)
+# Comparaison à un réseau scale-free, puis à un modèle hybride (chapitre 4)
 
 ## Pourquoi
 
-Un clustering ou une distance ne disent rien seuls : il faut les comparer à ce que produirait le hasard avec le même nombre de combattants et de combats. On tire 200 réseaux d'Erdős–Rényi G(n, m) de même taille que chaque réseau non orienté observé, et on calcule le rapport entre le clustering observé et le clustering aléatoire, ainsi que celui des distances moyennes. L'indice *small world* vaut σ = (C / C_aléatoire) / (L / L_aléatoire). Un réseau est « petit monde » si son clustering est bien plus élevé qu'au hasard (σ > 1) pour une distance comparable.
+Un réseau aléatoire d'Erdős–Rényi ne constitue pas une référence pertinente ici, puisque les combats ne sont évidemment pas attribués au hasard. La question intéressante est celle du **mécanisme de formation** : les combattants qui ont déjà beaucoup combattu attirent-ils davantage de combats, comme dans un réseau *scale-free* (attachement préférentiel, Barabási–Albert) ? On procède en trois temps :
 
-```{r aleatoire}
-set.seed(42)
-comparaison_aleatoire <- function(g, B = 200) {
-  gu <- non_oriente(g)
-  n <- vcount(gu); m <- ecount(gu)
-  sims <- replicate(B, {
-    r  <- sample_gnm(n, m)
-    rc <- plus_grande_composante(r)
-    c(C = transitivity(r, type = "global"), L = mean_distance(rc, directed = FALSE))
-  })
-  C_obs <- transitivity(gu, type = "global")
-  L_obs <- mean_distance(plus_grande_composante(gu), directed = FALSE)
-  tibble(C_observe = C_obs, C_aleatoire = mean(sims["C", ], na.rm = TRUE),
-         L_observee = L_obs, L_aleatoire = mean(sims["L", ], na.rm = TRUE)) %>%
-    mutate(rapport_C = C_observe / C_aleatoire,
-           rapport_L = L_observee / L_aleatoire,
-           sigma     = rapport_C / rapport_L)
+1. **la distribution des degrés** suit-elle une loi de puissance ? Ajustement par la méthode de Clauset, Shalizi et Newman (2009), comparé à une loi exponentielle et à une loi lognormale (test de Vuong) ;
+2. **comparaison à des réseaux de Barabási–Albert** de même taille (même nombre de combattants et de paires d'adversaires) : hubs, hétérogénéité des degrés, clustering, distance, assortativité ;
+3. **modèle hybride de Jackson et Rogers** (2007) : estimation du paramètre *r* (ou *a* = *r* / (1 + *r*), la part des liens formés « au hasard »), puis simulation de réseaux hybrides pour mesurer à quel point ils s'écartent du réseau observé.
+
+## Distribution des degrés et loi de puissance
+
+On utilise le réseau complet (1994–2024), seul assez grand pour étudier une queue de distribution ; le degré est le nombre de combats.
+
+```{r loi-puissance}
+g_complet <- graph_from_data_frame(transmute(combats, from = perdant, to = gagnant), directed = TRUE)
+k <- igraph::degree(g_complet, mode = "all")
+c(combattants = length(k), moyenne = mean(k), mediane = median(k), maximum = max(k), un_seul_combat = mean(k == 1))
+
+# Loi de puissance discrète (Clauset et al., 2009) : exposant par maximum de vraisemblance (approximation
+# continue), seuil xmin choisi pour minimiser la distance de Kolmogorov-Smirnov
+ajuster_puissance <- function(x, xmin) {
+  y <- x[x >= xmin]
+  gamma <- 1 + length(y) / sum(log(y / (xmin - 0.5)))
+  s <- xmin:max(y); p <- s^(-gamma); p <- p / sum(p)
+  ks <- max(abs(ecdf(y)(s) - cumsum(p)))
+  c(xmin = xmin, gamma = gamma, n_queue = length(y), ks = ks)
 }
-tableau_aleatoire <- bind_rows(lapply(categories_analyse, function(cat)
-  mutate(comparaison_aleatoire(reseaux[[cat]]), categorie = noms_fr[cat]))) %>%
-  relocate(categorie)
-tableau_aleatoire %>% mutate(across(where(is.double), ~ round(.x, 3)))
+seuils <- t(sapply(1:15, ajuster_puissance, x = k))
+puissance <- seuils[which.min(seuils[, "ks"]), ]
+puissance
+
+# Test de Vuong sur la même queue : loi de puissance contre exponentielle (géométrique) et lognormale
+xm <- puissance["xmin"]; y <- k[k >= xm]; gam <- puissance["gamma"]
+ll_puissance <- -gam * log(y) - log(sum((xm:10000)^(-gam)))
+lambda <- 1 / (mean(y) - xm + 1)
+ll_exponentielle <- log(lambda) + (y - xm) * log(1 - lambda)
+mu <- mean(log(y)); sig <- sd(log(y))
+ll_lognormale <- log(pnorm((log(y + 0.5) - mu) / sig) - pnorm((log(y - 0.5) - mu) / sig)) -
+                 log(1 - pnorm((log(xm - 0.5) - mu) / sig))
+vuong <- function(l1, l2) {               # R > 0 : la loi de puissance est meilleure
+  dl <- l1 - l2; z <- sum(dl) / (sqrt(length(dl)) * sd(dl))
+  c(R = sum(dl), z = z, p_valeur = 2 * pnorm(-abs(z)))
+}
+rbind(contre_exponentielle = vuong(ll_puissance, ll_exponentielle),
+      contre_lognormale    = vuong(ll_puissance, ll_lognormale))
 ```
 
-## Distribution des degrés
+## Comparaison à des réseaux de Barabási–Albert
 
-Le cours oppose deux formes de distribution des degrés : la loi de Poisson du réseau aléatoire et la loi de puissance des réseaux *scale free*. On trace la distribution du nombre de combats par combattant sur l'ensemble de la période (1994–2024, réseau complet), en échelle log-log, avec la loi de Poisson de même moyenne.
+Les réseaux de Barabási–Albert sont simulés avec le même nombre de nœuds et de liens que chaque réseau observé (version non orientée, un lien par paire d'adversaires) : chaque nouveau nœud apporte un ou deux liens, de sorte que le nombre total de liens soit le même. On compare la moyenne de 200 simulations au réseau observé.
 
-```{r degres, fig.width=7, fig.height=4.2}
-g_complet <- graph_from_data_frame(transmute(combats, from = perdant, to = gagnant), directed = TRUE)
-deg <- igraph::degree(g_complet, mode = "all")
-distribution <- tibble(degre = deg) %>% count(degre) %>% mutate(part = n / sum(n))
-poisson <- tibble(degre = 1:max(deg)) %>% mutate(part = dpois(degre, mean(deg)) / (1 - dpois(0, mean(deg))))
-c(moyenne = mean(deg), mediane = median(deg), maximum = max(deg), un_seul_combat = mean(deg == 1))
+```{r barabasi-albert}
+set.seed(42)
+# Indicateurs comparés (réseau non orienté)
+indicateurs_modele <- function(h) {
+  kk <- igraph::degree(h)
+  hc <- plus_grande_composante(h)
+  c(part_un_adversaire = mean(kk == 1), degre_max = max(kk), cv_degres = sd(kk) / mean(kk),
+    clustering = transitivity(h, type = "global"), distance = mean_distance(hc, directed = FALSE),
+    assortativite = assortativity_degree(h, directed = FALSE))
+}
+# Barabási–Albert de même taille : n nœuds, m liens
+simuler_ba <- function(n, m) {
+  q <- m / (n - 1)
+  liens_par_nœud <- c(0, floor(q) + rbinom(n - 1, 1, q - floor(q)))
+  simplify(sample_pa(n, out.seq = liens_par_nœud, directed = FALSE))
+}
+comparer_ba <- function(gu, B = 200) {
+  obs <- indicateurs_modele(gu)
+  ba  <- rowMeans(replicate(B, indicateurs_modele(simuler_ba(vcount(gu), ecount(gu)))), na.rm = TRUE)
+  tibble(indicateur = names(obs), observe = obs, barabasi_albert = ba)
+}
+# Réseau complet
+comparer_ba(non_oriente(g_complet), B = 50)
 
-fig_degres <- ggplot(distribution, aes(degre, part)) +
-  geom_point(colour = "#2a78d6", size = 2) +
-  geom_line(data = filter(poisson, part > 1e-5), linetype = "dashed", colour = "grey35") +
+# Par catégorie (combats 2021-2023)
+comparaison_ba <- bind_rows(lapply(categories_analyse, function(cat)
+  mutate(comparer_ba(non_oriente(reseaux[[cat]])), categorie = noms_fr[cat])))
+comparaison_ba %>%
+  filter(indicateur %in% c("degre_max", "clustering", "distance", "assortativite")) %>%
+  mutate(across(where(is.double), ~ round(.x, 2)))
+```
+
+## Modèle hybride de Jackson et Rogers
+
+Dans le modèle de Jackson et Rogers (2007), chaque nouveau nœud crée une part *a* de ses liens au hasard et une part 1 − *a* parmi les voisins de ses nouveaux voisins, ce qui revient à un attachement préférentiel partiel. La distribution des degrés vérifie 1 − F(d) = ((d₀ + r m) / (d + r m))^(1 + r), avec *m* la moitié du degré moyen et *r* = *a* / (1 − *a*). On estime *r* comme dans le cours : on cherche la valeur pour laquelle la pente de log(1 − F(d)) en fonction de log(d + r m) vaut −(1 + r). *r* proche de 0 correspond à un réseau scale-free, *r* très grand à un réseau aléatoire.
+
+```{r jackson-rogers}
+estimer_jr <- function(kk) {
+  m <- mean(kk) / 2
+  ds <- sort(unique(kk)); ds <- ds[-length(ds)]
+  survie <- sapply(ds, function(x) mean(kk > x))
+  ecart <- function(r) -coef(lm(log(survie) ~ log(ds + r * m)))[2] - (1 + r)
+  grille <- seq(0.01, 30, by = 0.01)
+  r <- grille[which.min(abs(sapply(grille, ecart)))]
+  ajust <- lm(log(survie) ~ log(ds + r * m))
+  list(r = r, a = r / (1 + r), r2 = summary(ajust)$r.squared, m = m, ajustement = ajust)
+}
+jr_complet <- estimer_jr(k)
+c(r = jr_complet$r, a = jr_complet$a, R2 = jr_complet$r2)
+
+# Même estimation par catégorie (2021-2023) : réseaux petits, estimations plus fragiles
+jr_categories <- bind_rows(lapply(categories_analyse, function(cat) {
+  e <- estimer_jr(igraph::degree(non_oriente(reseaux[[cat]])))
+  tibble(categorie = noms_fr[cat], r = e$r, a = e$a, R2 = e$r2)
+}))
+jr_categories %>% mutate(across(where(is.double), ~ round(.x, 2)))
+```
+
+```{r figure-degres, fig.width=7, fig.height=4.2}
+# Figure : distribution cumulée des degrés (log-log), loi de puissance et modèle hybride ajustés
+survie_obs <- tibble(degre = sort(unique(k))) %>% mutate(survie = sapply(degre, function(x) mean(k >= x)))
+xm <- puissance["xmin"]
+courbe_puissance <- tibble(degre = xm:max(k)) %>%
+  mutate(survie = mean(k >= xm) * (degre / xm)^(1 - puissance["gamma"]))
+# Modèle hybride ajusté : P(D > d) = ((d0 + r m) / (d + r m))^(1 + r). L'ordonnée à l'origine de la
+# régression donne d0 ; le modèle n'est défini qu'au-delà de d0 (en dessous, il dépasserait 100 %).
+d0_jr <- exp(coef(jr_complet$ajustement)[1] / (1 + jr_complet$r)) - jr_complet$r * jr_complet$m
+c(d0 = unname(d0_jr))
+courbe_jr <- tibble(degre = 1:max(k)) %>%
+  mutate(survie = exp(predict(jr_complet$ajustement, newdata = data.frame(ds = degre - 1)))) %>%
+  filter(degre - 1 >= d0_jr)
+courbes <- bind_rows(mutate(courbe_puissance, modele = "Loi de puissance (queue)"),
+                     mutate(courbe_jr, modele = "Modèle hybride (Jackson-Rogers)"))
+fig_degres <- ggplot(survie_obs, aes(degre, survie)) +
+  geom_point(colour = "#2a78d6", size = 1.8) +
+  geom_line(data = courbes, aes(colour = modele, linetype = modele), linewidth = 0.8) +
+  scale_colour_manual(values = c("Loi de puissance (queue)" = "grey25", "Modèle hybride (Jackson-Rogers)" = "#eb6834")) +
+  scale_linetype_manual(values = c("Loi de puissance (queue)" = "dashed", "Modèle hybride (Jackson-Rogers)" = "solid")) +
   scale_x_log10() + scale_y_log10(labels = function(x) paste0(signif(100 * x, 2), " %")) +
-  labs(x = "Nombre de combats à l'UFC (échelle logarithmique)", y = "Part des combattants (échelle log.)",
-       caption = "Points : distribution observée (2 472 combattants). Tirets : loi de Poisson de même moyenne.") +
-  theme_minimal(base_size = 11) + theme(panel.grid.minor = element_blank())
+  labs(x = "Nombre de combats d (échelle log.)", y = "Part des combattants ayant au moins d combats",
+       colour = NULL, linetype = NULL) +
+  theme_minimal(base_size = 11) + theme(panel.grid.minor = element_blank(), legend.position = "top")
 fig_degres
+```
+
+```{r simulation-hybride}
+# Simulation d'un réseau hybride de Jackson-Rogers de n nœuds et environ m liens, avec une part a
+# de liens au hasard. Chaque nouveau nœud choisit d'abord au moins un contact au hasard, puis
+# une part 1 - a de ses liens parmi les voisins de ces contacts.
+simuler_jr <- function(n, m, a, n0 = 3) {
+  voisins <- vector("list", n); for (i in seq_len(n)) voisins[[i]] <- integer(0)
+  lier <- function(i, j) { voisins[[i]] <<- c(voisins[[i]], j); voisins[[j]] <<- c(voisins[[j]], i) }
+  for (i in 2:n0) for (j in 1:(i - 1)) lier(i, j)
+  q <- (m - n0 * (n0 - 1) / 2) / (n - n0)                 # liens apportés par nouveau nœud
+  for (v in (n0 + 1):n) {
+    existants <- seq_len(v - 1)
+    k_v <- min(v - 1, max(1, floor(q) + rbinom(1, 1, q - floor(q))))
+    n_hasard <- max(1, rbinom(1, k_v, a))
+    n_reseau <- k_v - n_hasard
+    choisis  <- existants[sample.int(length(existants), n_hasard)]
+    if (n_reseau > 0) {
+      vivier <- setdiff(unique(unlist(voisins[choisis])), choisis)
+      if (length(vivier) >= n_reseau) {
+        choisis <- c(choisis, vivier[sample.int(length(vivier), n_reseau)])
+      } else {                                               # pas assez de voisins : complété au hasard
+        reste <- setdiff(existants, c(choisis, vivier))
+        choisis <- c(choisis, vivier, reste[sample.int(length(reste), min(length(reste), n_reseau - length(vivier)))])
+      }
+    }
+    for (j in choisis) lier(v, j)
+  }
+  aretes <- do.call(rbind, lapply(seq_len(n), function(i) {
+    w <- voisins[[i]][voisins[[i]] > i]; if (length(w)) cbind(i, w) }))
+  simplify(graph_from_edgelist(aretes, directed = FALSE))
+}
+
+# Les deux catégories illustrées : observé vs Barabási-Albert vs hybride (a estimé sur le réseau complet)
+exemples <- c("Lightweight", "Women's Strawweight")
+trois_modeles <- bind_rows(lapply(exemples, function(cat) {
+  gu <- non_oriente(reseaux[[cat]])
+  sims_ba <- replicate(200, indicateurs_modele(simuler_ba(vcount(gu), ecount(gu))))
+  sims_jr <- replicate(200, indicateurs_modele(simuler_jr(vcount(gu), ecount(gu), jr_complet$a)))
+  tibble(categorie = noms_fr[cat], indicateur = rownames(sims_ba),
+         observe = indicateurs_modele(gu), barabasi_albert = rowMeans(sims_ba, na.rm = TRUE),
+         hybride = rowMeans(sims_jr, na.rm = TRUE))
+}))
+trois_modeles %>% mutate(across(where(is.double), ~ round(.x, 2)))
+```
+
+```{r figure-trois-modeles, fig.width=12, fig.height=8}
+# Figure à six panneaux : pour chaque catégorie, le réseau observé, un réseau de Barabási-Albert
+# et un réseau hybride de même taille (plus grande composante, taille des nœuds ~ degré)
+dessiner_modele <- function(h, titre) {
+  h <- plus_grande_composante(h)
+  kk <- igraph::degree(h)
+  plot(h, layout = layout_with_fr(h), vertex.size = 2.5 + 1.6 * kk, vertex.label = NA,
+       vertex.color = ifelse(kk >= 8, "#eb6834", "#2a78d6"), vertex.frame.color = NA,
+       edge.color = adjustcolor("grey45", alpha.f = 0.6), main = titre, cex.main = 1.1)
+}
+trois_panneaux <- function() {
+  par(mfrow = c(2, 3), mar = c(0.5, 0.5, 2.5, 0.5))
+  for (cat in exemples) {
+    set.seed(7)
+    gu <- non_oriente(reseaux[[cat]])
+    dessiner_modele(gu, paste0(noms_fr[cat], " — réseau observé"))
+    dessiner_modele(simuler_ba(vcount(gu), ecount(gu)), "Scale-free (Barabási–Albert)")
+    dessiner_modele(simuler_jr(vcount(gu), ecount(gu), jr_complet$a),
+                    paste0("Hybride (Jackson–Rogers, a = ", format(round(jr_complet$a, 2), decimal.mark = ","), ")"))
+  }
+}
+trois_panneaux()
 ```
 
 # Cohérence de la hiérarchie : les triades
@@ -359,13 +513,20 @@ dessiner("Women's Strawweight", "Poids pailles (femmes), combats 2021–2023")
 ```{r export}
 dir.create("resultats/figures", showWarnings = FALSE, recursive = TRUE)
 write_csv(tableau_global,     "resultats/description_indicateurs_globaux.csv")
-write_csv(tableau_aleatoire,  "resultats/description_comparaison_aleatoire.csv")
+write_csv(comparaison_ba,     "resultats/description_comparaison_barabasi_albert.csv")
+write_csv(jr_categories,      "resultats/description_jackson_rogers_categories.csv")
+write_csv(trois_modeles,      "resultats/description_trois_modeles.csv")
+write_csv(as_tibble(as.list(puissance)), "resultats/description_loi_puissance.csv")
+write_csv(tibble(r = jr_complet$r, a = jr_complet$a, R2 = jr_complet$r2, m = jr_complet$m, d0 = unname(d0_jr)),
+          "resultats/description_jackson_rogers_complet.csv")
 write_csv(triades,            "resultats/description_triades.csv")
 write_csv(comparaison_groupes, "resultats/description_classes_vs_non_classes.csv")
 write_csv(as_tibble(as.data.frame.matrix(round(matrice_correlations, 3)), rownames = "mesure"),
           "resultats/description_correlations_centralites.csv")
 
 ggsave("resultats/figures/distribution_degres.png", fig_degres, width = 7, height = 4.2, dpi = 200, bg = "white")
+png("resultats/figures/trois_modeles.png", width = 2700, height = 1800, res = 200)
+trois_panneaux(); dev.off()
 png("resultats/figures/reseau_legers_2021_2023.png", width = 2000, height = 1800, res = 200)
 dessiner("Lightweight", ""); dev.off()
 png("resultats/figures/reseau_pailles_2021_2023.png", width = 1800, height = 1600, res = 200)
