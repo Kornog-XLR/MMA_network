@@ -763,6 +763,44 @@ robustesse <- bind_rows(robustesse, resumer(hebdo, "Classement hebdomadaire"))
 robustesse
 ```
 
+# Analyse complémentaire (non pré-enregistrée) : le PageRank fait-il mieux que le bilan ?
+
+## Pourquoi
+
+Cette section a été **ajoutée après la première exécution** (16/10/2026, voir le journal des écarts). La description du réseau (`description_reseaux.Rmd`) montre que, sur trois ans, le PageRank est très corrélé au nombre de victoires. Il faut donc vérifier que la comparaison avec le classement officiel ne revient pas à une simple comparaison avec le bilan. On recalcule la concordance de H1 en remplaçant le rang PageRank par deux témoins simples, calculés sur la même fenêtre et parmi les mêmes classés :
+
+- le **nombre de victoires** ;
+- le **solde** victoires − défaites.
+
+Si le PageRank n'apportait rien de plus que le bilan, les corrélations avec le classement officiel seraient du même ordre.
+
+```{r temoin-bilan}
+temoins <- ecarts %>%
+  semi_join(filter(resume, retenue), by = c("categorie", "date_photo")) %>%
+  group_by(categorie, date_photo) %>%
+  mutate(rang_victoires = rank(-victoires,             ties.method = "average"),
+         rang_solde     = rank(-(victoires - defaites), ties.method = "average")) %>%
+  summarise(rho_pagerank  = cor(rang_officiel, rang_pr,        method = "spearman"),
+            rho_victoires = cor(rang_officiel, rang_victoires, method = "spearman"),
+            rho_solde     = cor(rang_officiel, rang_solde,     method = "spearman"),
+            rho_pr_victoires = cor(rang_pr, rang_victoires,    method = "spearman"),
+            .groups = "drop")
+
+temoins %>%
+  summarise(photos = n(),
+            across(starts_with("rho_"), median, .names = "median_{.col}"))
+
+# Le PageRank concorde-t-il mieux avec le classement officiel que les témoins ? (Wilcoxon apparié)
+wilcox.test(temoins$rho_pagerank, temoins$rho_victoires, paired = TRUE, exact = FALSE)
+wilcox.test(temoins$rho_pagerank, temoins$rho_solde,     paired = TRUE, exact = FALSE)
+
+# Par catégorie
+temoins %>%
+  group_by(categorie) %>%
+  summarise(rho_pagerank = median(rho_pagerank), rho_victoires = median(rho_victoires),
+            rho_solde = median(rho_solde), .groups = "drop")
+```
+
 # Export des résultats pour la rédaction
 
 Les tables sont écrites dans `resultats/`, pour être reprises dans le mémoire sans recopier les chiffres à la main.
@@ -775,6 +813,7 @@ write_csv(ecarts_h2,             "resultats/ecarts_par_photo.csv")
 write_csv(par_combattant,        "resultats/ecarts_par_combattant.csv")
 write_csv(combats_suivants,      "resultats/h3_combats_suivants.csv")
 write_csv(robustesse,            "resultats/robustesse.csv")
+write_csv(temoins,               "resultats/temoin_bilan.csv")
 ```
 
 # Journal des écarts au plan
@@ -786,3 +825,4 @@ Toute modification de ce notebook faite **après sa première exécution** est c
 | 2026-10-16 | `classement_a_la_date()` et `comparer_photo()` : argument `classements = get("classements")` renommé `tab_classements = classements` | Bug : référence récursive à l'argument par défaut (erreur « promesse déjà en cours d'évaluation »). Aucun changement de méthode. |
 | 2026-10-16 | `comparer_tout()` : l'argument `dates` est placé après `...` | Bug : par correspondance partielle, `comparer_tout(d = 0.5)` passait 0,5 comme `dates`. Aucun changement de méthode. |
 | 2026-10-16 | Robustesse hebdomadaire : le résultat est ajouté à la table `robustesse` avant l'export | Bug : la ligne « Classement hebdomadaire » était affichée mais pas exportée. Aucun changement de méthode. |
+| 2026-10-16 | **Ajout d'une analyse complémentaire non pré-enregistrée** : concordance du classement officiel avec deux témoins simples (nombre de victoires, solde victoires − défaites), section dédiée avant l'export | La description du réseau montre une corrélation de 0,94 entre PageRank et victoires ; il faut vérifier que le PageRank apporte plus que le bilan. Les analyses pré-enregistrées ne sont pas modifiées. |
